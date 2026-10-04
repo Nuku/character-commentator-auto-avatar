@@ -1,0 +1,3540 @@
+/*---
+compatibilityVersion: naiscript-1.0
+id: c0ac4e12-7f3b-4d9a-bea2-1f8e5d9c3a72
+name: Prose Coach
+createdAt: 1744416000000
+updatedAt: 1786885974023
+version: 1.6.61
+author: Directed by David Silver, coded by Claude AI.
+description: "Surgical writing coaching for show-don't-tell, action tag quality, and light general feedback. Click any flagged sentence in the sidebar to get inline surgical coaching. Right-click selected text in the document for manual coaching sessions."
+memoryLimit: 64
+config:
+  - name: coach_temperature
+    prettyName: Coach Temperature
+    type: number
+    default: 0.7
+    description: "Temperature for all coaching generation calls. Lower = more focused and consistent advice."
+    max: 1.5
+    min: 0.1
+  - name: enable_auto_scan
+    prettyName: Auto Scan
+    type: boolean
+    default: true
+    description: "Automatically run sidebar analysis after each generation."
+  - name: enable_auto_coaching
+    prettyName: Auto Coaching
+    type: boolean
+    default: true
+    description: "Generate the automatic coaching observations shown in the Auto-Detection panel."
+  - name: enable_auto_replace
+    prettyName: Auto Replace
+    type: boolean
+    default: false
+    description: "Automatically apply generated Show-Don't-Tell and adverb replacements after generation. Uses document edit permission."
+  - name: enable_sdt_detection
+    prettyName: "1"
+    type: boolean
+    default: true
+    description: "Show-Don't-Tell Detection — auto-flag telling words and filter verbs in the sidebar after generation."
+  - name: enable_tag_detection
+    prettyName: "2"
+    type: boolean
+    default: true
+    description: "Action Tag Detection — auto-flag purely explanatory action tags in the sidebar after generation."
+  - name: enable_adverb_detection
+    prettyName: "3"
+    type: boolean
+    default: true
+    description: "Adverb Detection — auto-flag -ly adverbs that may be leaning on weak verbs."
+  - name: enable_passive_detection
+    prettyName: "4"
+    type: boolean
+    default: true
+    description: "Passive Voice Detection — conservatively flag likely passive constructions for manual review."
+  - name: enable_general_coach
+    prettyName: "5"
+    type: boolean
+    default: true
+    description: "General Coach — lightweight one-liner observation after generation (low token use)."
+  - name: token_window
+    prettyName: Token Window
+    type: number
+    default: 1500
+    description: "Tokens of text to analyze after each generation. Keep low to save tokens."
+    max: 5000
+    min: 300
+    decimal: false
+  - name: context_paragraphs
+    prettyName: Context Paragraphs
+    type: number
+    default: 1
+    description: "Paragraphs included with flagged-sentence coaching. Starts with the current paragraph, then adds previous and next paragraphs alternately."
+    max: 9
+    min: 1
+    decimal: false
+  - name: sdt_prompt
+    prettyName: Show-Don't-Tell Prompt
+    type: string
+    default: "You are a surgical prose coach. The following is a narration sentence (dialogue has already been removed). Identify the telling word or phrase, then give a single revised sentence that shows the same thing through specific physical or sensory detail. Be direct and surgical — no preamble. Format: ISSUE: [word/phrase] | REVISION: [rewrite]"
+    description: "Prompt used for Show-Don't-Tell coaching on selected text."
+  - name: tag_prompt
+    prettyName: Action Tag Prompt
+    type: string
+    default: "You are a surgical prose coach. The writer has selected this passage. Find 1-2 action tags (the non-dialogue sentence attached to a line of dialogue) that are purely explanatory — they just tell us how the character feels or confirm the dialogue's meaning. For each, quote the action tag, name what it explains instead of shows, then give a revised version that reveals character through a specific physical action or detail instead. Be surgical — no preamble. Format: TAG: [quote] | ISSUE: [what it explains] | REVISION: [rewrite]"
+    description: "Prompt used for Action Tag coaching on selected text."
+  - name: reaction_prompt
+    prettyName: Reaction Tell Prompt
+    type: string
+    default: "You are a surgical prose coach. The following is a narration sentence (dialogue has already been removed). The flagged word names a reaction directly instead of showing it through physical detail. Give a single revised sentence that conveys the same moment through specific body language, sensation, or action — without naming the reaction. Be direct and surgical — no preamble. Format: ISSUE: [word] | REVISION: [rewrite]"
+    description: "Prompt used for reaction tell coaching (yelped, flinched, relief, dread, etc)."
+  - name: general_prompt
+    prettyName: General Coach Prompt
+    type: string
+    default: "You are a prose coach. Respond with exactly three sentences separated by newlines, no labels or preamble. Line 1: one craft observation about this passage — pacing, rhythm, texture, or structure. Line 2: quote or closely paraphrase one specific sentence from the passage that you think could be strengthened, and briefly say why — or write 'Nothing stands out.' if nothing does. Line 3: a single musing about what might be happening in the larger story or world, purely speculative and imaginative, unrelated to the craft. Output format: sentence1\nsentence2\nsentence3"
+    description: "Prompt used for the General Coach — three sentences: a craft observation, a specific line that could be strengthened, and a speculative story musing."
+---*/
+
+// ============================================================================
+// PROSE COACH v1.6.61
+// ============================================================================
+// A surgical writing coach for NovelAI.
+//
+// Three coaching modes:
+//   1. Show-Don't-Tell (SDT) — finds telling sentences and models sensory rewrites
+//   2. Action Tag Coach — spots purely explanatory tags; suggests character-revealing ones
+//   3. General Coach — three-part observation: craft note, line to strengthen, story musing
+//   4. Cheap scoring layer — ranks regex hits by likelihood before showing flags
+//
+// Usage:
+//   - Auto-detected flags appear in the sidebar after each generation (zero token cost)
+//   - CLICK any flagged sentence to fetch surgical coaching inline — expands right there
+//   - Coaching is lazy-fetched on first click and cached; subsequent clicks just toggle
+//   - Right-click selected text in the document for manual coaching on any passage
+//   - General Coach fires a lightweight AI call after generation if enabled
+//
+// Design goals:
+//   - Surgical and specific, not generic
+//   - Token-efficient: regex detection is zero-cost; General Coach capped at 240 tokens (three sentences)
+//   - Flag coaching is on-demand — only burns tokens when you actually click
+//   - Non-invasive: never edits the document, only advises
+
+// ============================================================================
+// WORD LISTS — ZERO-COST REGEX DETECTION
+// ============================================================================
+
+// Filter verbs: perception routed through the POV character's awareness
+// These tell us the character noticed something instead of just showing it
+const FILTER_VERBS = new Set([
+  'felt', 'feel', 'feels', 'feeling',
+  'noticed', 'notice', 'notices', 'noticing',
+  'realized', 'realize', 'realizes', 'realizing',
+  'seemed', 'seem', 'seems', 'seeming',
+  'thought', 'think', 'thinks', 'thinking',
+  'wondered', 'wonder', 'wonders', 'wondering',
+  'sensed', 'sense', 'senses', 'sensing',
+  'watched', 'watch', 'watches', 'watching',
+  'saw', 'see', 'sees', 'seeing',
+  'heard', 'hear', 'hears', 'hearing',
+  'decided', 'decide', 'decides', 'deciding',
+  'recognized', 'recognize', 'recognizes', 'recognizing',
+  'understood', 'understand', 'understands', 'understanding',
+  'considered', 'consider', 'considers', 'considering',
+  'observed', 'observe', 'observes', 'observing',
+  'remembered', 'remember', 'remembers', 'remembering',
+  'knew', 'know', 'knows', 'knowing'
+]);
+
+// Telling adjectives: evaluate rather than evoke
+const TELLING_WORDS = new Set([
+  'beautiful', 'ugly', 'terrible', 'wonderful', 'amazing',
+  'incredible', 'horrible', 'awful', 'gorgeous', 'stunning',
+  'perfect', 'lovely', 'frightening', 'terrifying', 'exciting',
+  'boring', 'interesting', 'magnificent', 'hideous', 'dreadful',
+  'heartbreaking', 'breathtaking', 'mesmerizing', 'devastating',
+  'delightful', 'disgusting', 'charming', 'enchanting', 'miserable',
+  'sad', 'happy', 'angry', 'furious', 'joyful', 'gloomy',
+  'peaceful', 'chaotic', 'eerie', 'haunting', 'menacing'
+]);
+
+// Reaction tells: name the character's emotional or physical reaction directly
+// instead of showing it through specific detail. Different from filter verbs
+// (which route perception) — these are the named response itself.
+const REACTION_TELLS = new Set([
+  // Named emotional states
+  'relief', 'dread', 'panic', 'fear', 'terror', 'horror', 'despair',
+  'grief', 'shame', 'guilt', 'rage', 'fury', 'joy', 'hope', 'doubt',
+  'excitement', 'anxiety', 'nervousness', 'embarrassment', 'confusion',
+  'frustration', 'satisfaction', 'disappointment', 'surprise', 'shock',
+  'comfort', 'discomfort', 'unease', 'tension', 'dread',
+  // Named physical reactions that tell rather than show
+  'yelped', 'yelp', 'yelps', 'yelping',
+  'flinched', 'flinch', 'flinches', 'flinching',
+  'cringed', 'cringe', 'cringes', 'cringing',
+  'recoiled', 'recoil', 'recoils', 'recoiling',
+  'startled', 'startle', 'startles', 'startling',
+  'trembled', 'tremble', 'trembles', 'trembling',
+  'shuddered', 'shudder', 'shudders', 'shuddering',
+  'shivered', 'shiver', 'shivers', 'shivering',
+  'tensed', 'tense', 'tenses', 'tensing',
+  'relaxed', 'relax', 'relaxes', 'relaxing',
+  'froze', 'freeze', 'freezes', 'freezing',
+  'stiffened', 'stiffen', 'stiffens', 'stiffening',
+  'slumped', 'slump', 'slumps', 'slumping',
+  'deflated', 'deflate', 'deflates', 'deflating',
+  'brightened', 'brighten', 'brightens', 'brightening',
+  'darkened', 'darken', 'darkens', 'darkening'
+]);
+
+// Purely explanatory action tag verbs — functional but rarely revealing
+// These tell us how the character delivered dialogue instead of showing who they are
+const EXPLANATORY_TAG_VERBS = new Set([
+  'said', 'replied', 'answered', 'responded', 'stated',
+  'told', 'spoke', 'talked', 'asked', 'questioned',
+  'shouted', 'yelled', 'cried', 'whispered', 'muttered',
+  'explained', 'clarified', 'added', 'continued', 'agreed',
+  'nodded', 'smiled', 'frowned', 'shrugged', 'laughed',
+  'sighed', 'groaned', 'gasped', 'snorted', 'scoffed'
+]);
+
+// Adverb-heavy attribution — tag + adverb combos that explain instead of show
+const ATTRIBUTION_ADVERBS = new Set([
+  'quietly', 'softly', 'gently', 'loudly', 'angrily', 'sadly',
+  'happily', 'nervously', 'anxiously', 'calmly', 'coldly', 'warmly',
+  'flatly', 'dryly', 'sharply', 'firmly', 'weakly', 'wearily',
+  'excitedly', 'breathlessly', 'absently', 'thoughtfully',
+  'hesitantly', 'reluctantly', 'earnestly', 'desperately', 'fiercely'
+]);
+
+// ============================================================================
+// CHEAP TRIAGE SCORING — STILL ZERO-COST, NO AI
+// ============================================================================
+// The word lists intentionally stay simple and fast. This layer reduces false
+// positives by ranking local context before the sidebar shows a flag.
+
+const COGNITIVE_FILTERS = new Set([
+  'realized', 'realize', 'realizes', 'realizing',
+  'thought', 'think', 'thinks', 'thinking',
+  'wondered', 'wonder', 'wonders', 'wondering',
+  'decided', 'decide', 'decides', 'deciding',
+  'understood', 'understand', 'understands', 'understanding',
+  'knew', 'know', 'knows', 'knowing',
+  'remembered', 'remember', 'remembers', 'remembering',
+  'recognized', 'recognize', 'recognizes', 'recognizing'
+]);
+
+const PERCEPTION_FILTERS = new Set([
+  'felt', 'feel', 'feels', 'feeling',
+  'noticed', 'notice', 'notices', 'noticing',
+  'sensed', 'sense', 'senses', 'sensing',
+  'watched', 'watch', 'watches', 'watching',
+  'saw', 'see', 'sees', 'seeing',
+  'heard', 'hear', 'hears', 'hearing',
+  'observed', 'observe', 'observes', 'observing',
+  'seemed', 'seem', 'seems', 'seeming'
+]);
+
+const STRONG_TELLS = new Set([
+  'terrifying', 'frightening', 'heartbreaking', 'devastating', 'dreadful',
+  'horrible', 'awful', 'miserable', 'furious', 'angry', 'sad', 'happy',
+  'dread', 'panic', 'terror', 'horror', 'despair', 'shame', 'guilt', 'rage',
+  'anxiety', 'embarrassment', 'confusion', 'frustration', 'surprise', 'shock'
+]);
+
+const CONCRETE_DETAIL_WORDS = new Set([
+  'hand', 'hands', 'finger', 'fingers', 'knuckle', 'knuckles', 'jaw', 'throat',
+  'chest', 'shoulder', 'shoulders', 'breath', 'eyes', 'eye', 'mouth', 'lips',
+  'ears', 'hoof', 'hooves', 'tail', 'wing', 'wings', 'skin', 'spine', 'stomach',
+  'blood', 'sweat', 'voice', 'floor', 'door', 'wall', 'table', 'cup', 'glass',
+  'knife', 'light', 'shadow', 'smoke', 'rain', 'wind', 'cold', 'heat'
+]);
+
+const CONCRETE_ACTION_WORDS = new Set([
+  'grabbed', 'gripped', 'clenched', 'pressed', 'rubbed', 'scratched', 'stepped',
+  'backed', 'turned', 'looked', 'lowered', 'raised', 'swallowed', 'blinked',
+  'wiped', 'pulled', 'pushed', 'tapped', 'dragged', 'shifted', 'leaned', 'stared',
+  'locked', 'curled', 'folded', 'opened', 'closed', 'bared', 'showed'
+]);
+
+const SDT_SUPPRESS_PHRASES = [
+  'felt around', 'felt for', 'feel around', 'feel for',
+  'saw through', 'see through', 'seeing through',
+  'watched over', 'watch over', 'watching over',
+  'thought better of', 'thought nothing of',
+  'known as', 'recognized as', 'understood as',
+  'decided by', 'observed by'
+];
+
+const WEAK_ATTRIBUTION_ONLY = new Set([
+  'said', 'asked', 'replied', 'answered', 'responded', 'stated', 'told', 'spoke', 'talked'
+]);
+
+function normalizeWordList(text: string): string[] {
+  return text.toLowerCase().replace(/[^a-z\s]/g, ' ').split(/\s+/).filter(Boolean);
+}
+
+function containsPhrase(text: string, phrases: string[]): boolean {
+  const padded = ` ${text.toLowerCase().replace(/[^a-z\s]/g, ' ').replace(/\s+/g, ' ')} `;
+  return phrases.some(phrase => padded.includes(` ${phrase} `));
+}
+
+function countMatches(words: string[], set: Set<string>): number {
+  return words.reduce((count, word) => count + (set.has(word) ? 1 : 0), 0);
+}
+
+function nearbyWords(words: string[], word: string, radius: number = 4): string[] {
+  const idx = words.indexOf(word);
+  if (idx === -1) return [];
+  return words.slice(Math.max(0, idx - radius), Math.min(words.length, idx + radius + 1));
+}
+
+function scoreSdtCandidate(word: string, type: SdtFlag['type'], narration: string): number {
+  const words = normalizeWordList(narration);
+  if (words.length < 3) return -10;
+  if (containsPhrase(narration, SDT_SUPPRESS_PHRASES)) return -10;
+
+  let score = type === 'reaction_tell' ? 2.5 : type === 'filter_verb' ? 2.0 : 1.4;
+  if (STRONG_TELLS.has(word)) score += 1.0;
+  if (COGNITIVE_FILTERS.has(word)) score += 0.6;
+  if (PERCEPTION_FILTERS.has(word)) score += 0.3;
+
+  const idx = words.indexOf(word);
+  const next = idx >= 0 ? words[idx + 1] : '';
+  const prev = idx > 0 ? words[idx - 1] : '';
+  const local = nearbyWords(words, word, 5);
+
+  if (type === 'filter_verb' && ['a', 'an', 'the'].includes(prev)) return -10;
+
+  // Common syntactic shapes that often indicate filtering/telling rather than action.
+  if (['that', 'how', 'like', 'as', 'if', 'to'].includes(next)) score += 0.7;
+  if (['very', 'so', 'too', 'really', 'utterly', 'completely'].includes(prev)) score += 0.5;
+  if (local.some(w => ['was', 'were', 'became', 'looked', 'seemed', 'felt'].includes(w))) score += 0.3;
+
+  const concreteCount = countMatches(words, CONCRETE_DETAIL_WORDS) + countMatches(words, CONCRETE_ACTION_WORDS);
+
+  // Minor tweak: penalize sentences that already carry physical/detail structure.
+  if (/[,\-]|\bwith\b|\bwhile\b/.test(narration)) score -= 0.4;
+
+  if (concreteCount >= 3) score -= 0.9;
+  else if (concreteCount >= 2) score -= 0.5;
+
+  // A named reaction plus body/action detail is often already doing enough showing.
+  if (type === 'reaction_tell' && concreteCount >= 2) score -= 0.6;
+
+  // Mild evaluative adjectives are noisy; require stronger context to surface them.
+  if (type === 'telling_word' && !STRONG_TELLS.has(word) && words.length < 8) score -= 0.6;
+
+  return score;
+}
+
+function scoreTagCandidate(tagVerb: string, adverb: string | null, narration: string): number {
+  const words = normalizeWordList(narration);
+  let score = 1.0;
+
+  if (adverb) score += 1.8;
+  if (!WEAK_ATTRIBUTION_ONLY.has(tagVerb)) score += 0.7;
+  if (['explained', 'clarified', 'agreed', 'sighed', 'groaned', 'gasped', 'scoffed', 'shrugged', 'smiled', 'frowned'].includes(tagVerb)) score += 0.5;
+
+  const concreteCount = countMatches(words, CONCRETE_DETAIL_WORDS) + countMatches(words, CONCRETE_ACTION_WORDS);
+  if (concreteCount >= 2) score -= 0.8;
+
+  // Plain said/asked/replied with no adverb is usually invisible, not a problem.
+  if (!adverb && WEAK_ATTRIBUTION_ONLY.has(tagVerb)) score -= 1.1;
+
+  return score;
+}
+
+// ============================================================================
+// INTERFACES & STATE
+// ============================================================================
+
+interface Config {
+  temperature: number;
+  enableAutoScan: boolean;
+  enableAutoCoaching: boolean;
+  enableAutoReplace: boolean;
+  enableSdtDetection: boolean;
+  enableTagDetection: boolean;
+  enableAdverbDetection: boolean;
+  enablePassiveDetection: boolean;
+  enableGeneralCoach: boolean;
+  tokenWindow: number;
+  contextParagraphs: number;
+  sdtPrompt: string;
+  reactionPrompt: string;
+  tagPrompt: string;
+  generalPrompt: string;
+}
+
+interface SdtFlag {
+  sentence: string;   // original full sentence, for display
+  narration: string;  // dialogue-stripped narration, passed to the AI prompt
+  context?: string;   // local paragraph context for coaching only, never replacement
+  word: string;
+  type: 'filter_verb' | 'telling_word' | 'reaction_tell';
+  score: number;
+}
+
+interface TagFlag {
+  sentence: string;
+  word: string;
+  type: 'explanatory_tag' | 'adverb_tag';
+  score: number;
+}
+
+interface AdverbFlag {
+  sentence: string;
+  narration: string;
+  context?: string;
+  word: string;
+  score: number;
+}
+
+interface PassiveFlag {
+  sentence: string;
+  narration: string;
+  context?: string;
+  phrase: string;
+  score: number;
+}
+
+interface CoachEntry {
+  id: string;
+  timestamp: number;
+  mode: 'sdt' | 'tag' | 'general' | 'auto_sdt' | 'auto_tag';
+  text: string;         // The passage that was coached (truncated for display)
+  passage: string;      // Full original passage — used for retrying the coach call
+  feedback: string;     // The generated or detected feedback
+}
+
+interface State {
+  config: Config;
+  panelId: string;
+  feed: CoachEntry[];
+  isCoaching: boolean;
+  lastAnalyzedText: string;
+  autoSdtFlags: SdtFlag[];
+  autoTagFlags: TagFlag[];
+  autoAdverbFlags: AdverbFlag[];
+  autoPassiveFlags: PassiveFlag[];
+  autoGeneral: string;
+  generationDebounceTimer: number | null;
+  refreshTimer: number | null;
+  isAutoReplacing: boolean;
+  // Inline flag coaching: expanded state and cached results
+  // Key format: "sdt-{index}" or "tag-{index}"
+  expandedFlags: Set<string>;
+  flagCoachCache: Map<string, string>;   // key -> coaching text
+  fetchingFlagKey: string | null;        // which flag is currently fetching
+  isRefreshing: boolean;
+}
+
+const state: State = {
+  config: {
+    temperature: 0.7,
+    enableAutoScan: true,
+    enableAutoCoaching: true,
+    enableAutoReplace: false,
+    enableSdtDetection: true,
+    enableTagDetection: true,
+    enableAdverbDetection: true,
+    enablePassiveDetection: true,
+    enableGeneralCoach: true,
+    tokenWindow: 1500,
+    contextParagraphs: 1,
+    sdtPrompt: "You are a surgical prose coach. The following is a narration sentence (dialogue has already been removed). Identify the telling word or phrase, then give a single revised sentence that shows the same thing through specific physical or sensory detail. Be direct and surgical — no preamble. Format: ISSUE: [word/phrase] | REVISION: [rewrite]",
+    reactionPrompt: "You are a surgical prose coach. The following is a narration sentence (dialogue has already been removed). The flagged word names a reaction directly instead of showing it through physical detail. Give a single revised sentence that conveys the same moment through specific body language, sensation, or action — without naming the reaction. Be direct and surgical — no preamble. Format: ISSUE: [word] | REVISION: [rewrite]",
+    tagPrompt: "You are a surgical prose coach. The writer has selected this passage. Find 1-2 action tags (the non-dialogue sentence attached to a line of dialogue) that are purely explanatory — they just tell us how the character feels or confirm the dialogue's meaning. For each, quote the action tag, name what it explains instead of shows, then give a revised version that reveals character through a specific physical action or detail instead. Be surgical — no preamble. Format: TAG: [quote] | ISSUE: [what it explains] | REVISION: [rewrite]",
+    generalPrompt: "You are a prose coach. Respond with exactly three sentences separated by newlines, no labels or preamble. Line 1: one craft observation about this passage — pacing, rhythm, texture, or structure. Line 2: quote or closely paraphrase one specific sentence from the passage that you think could be strengthened, and briefly say why — or write 'Nothing stands out.' if nothing does. Line 3: a single musing about what might be happening in the larger story or world, purely speculative and imaginative, unrelated to the craft. Output format: sentence1\nsentence2\nsentence3"
+  },
+  panelId: 'prose-coach-panel',
+  feed: [],
+  isCoaching: false,
+  lastAnalyzedText: '',
+  autoSdtFlags: [],
+  autoTagFlags: [],
+  autoAdverbFlags: [],
+  autoPassiveFlags: [],
+  autoGeneral: '',
+  generationDebounceTimer: null,
+  refreshTimer: null,
+  isAutoReplacing: false,
+  expandedFlags: new Set(),
+  flagCoachCache: new Map(),
+  fetchingFlagKey: null,
+  isRefreshing: false
+};
+
+// ============================================================================
+// CONFIG LOADING
+// ============================================================================
+
+const STORAGE_ENABLE_AUTO_SCAN = 'prose_coach_enable_auto_scan';
+const STORAGE_ENABLE_AUTO_COACHING = 'prose_coach_enable_auto_coaching';
+const STORAGE_ENABLE_AUTO_REPLACE = 'prose_coach_enable_auto_replace';
+
+async function loadConfig(): Promise<void> {
+  state.config.temperature = await api.v1.config.get('coach_temperature') || 0.7;
+  const configAutoScan = await api.v1.config.get('enable_auto_scan') ?? true;
+  const configAutoCoaching = await api.v1.config.get('enable_auto_coaching') ?? true;
+  const configAutoReplace = await api.v1.config.get('enable_auto_replace') ?? false;
+  state.config.enableAutoScan = await api.v1.storage.getOrDefault(STORAGE_ENABLE_AUTO_SCAN, configAutoScan);
+  state.config.enableAutoCoaching = await api.v1.storage.getOrDefault(STORAGE_ENABLE_AUTO_COACHING, configAutoCoaching);
+  state.config.enableAutoReplace = await api.v1.storage.getOrDefault(STORAGE_ENABLE_AUTO_REPLACE, configAutoReplace);
+  state.config.enableSdtDetection = await api.v1.config.get('enable_sdt_detection') ?? true;
+  state.config.enableTagDetection = await api.v1.config.get('enable_tag_detection') ?? true;
+  state.config.enableAdverbDetection = await api.v1.config.get('enable_adverb_detection') ?? true;
+  state.config.enablePassiveDetection = await api.v1.config.get('enable_passive_detection') ?? true;
+  state.config.enableGeneralCoach = await api.v1.config.get('enable_general_coach') ?? true;
+  state.config.tokenWindow = await api.v1.config.get('token_window') || 1500;
+  state.config.contextParagraphs = Math.max(1, Math.min(9, Math.floor(await api.v1.config.get('context_paragraphs') || 1)));
+  state.config.sdtPrompt = await api.v1.config.get('sdt_prompt') || state.config.sdtPrompt;
+  state.config.reactionPrompt = await api.v1.config.get('reaction_prompt') || state.config.reactionPrompt;
+  state.config.tagPrompt = await api.v1.config.get('tag_prompt') || state.config.tagPrompt;
+  state.config.generalPrompt = await api.v1.config.get('general_prompt') || state.config.generalPrompt;
+}
+
+async function toggleAutoReplace(): Promise<void> {
+  state.config.enableAutoReplace = !state.config.enableAutoReplace;
+  await api.v1.storage.set(STORAGE_ENABLE_AUTO_REPLACE, state.config.enableAutoReplace);
+  await updatePanel();
+  api.v1.ui.toast(
+    state.config.enableAutoReplace ? 'Auto replace enabled' : 'Auto replace disabled',
+    { type: 'success' }
+  );
+}
+
+async function toggleAutoCoaching(): Promise<void> {
+  state.config.enableAutoCoaching = !state.config.enableAutoCoaching;
+  await api.v1.storage.set(STORAGE_ENABLE_AUTO_COACHING, state.config.enableAutoCoaching);
+
+  if (!state.config.enableAutoCoaching) {
+    state.autoGeneral = '';
+    state.expandedFlags.delete('general-strengthen');
+    state.flagCoachCache.delete('general-strengthen');
+    if (state.fetchingFlagKey === 'general-strengthen') {
+      state.fetchingFlagKey = null;
+    }
+  }
+
+  await updatePanel();
+  api.v1.ui.toast(
+    state.config.enableAutoCoaching ? 'Auto coaching enabled' : 'Auto coaching disabled',
+    { type: 'success' }
+  );
+}
+
+async function triggerManualRefresh(): Promise<void> {
+  if (state.isRefreshing) return;
+
+  if (state.refreshTimer !== null) {
+    api.v1.timers.clearTimeout(state.refreshTimer);
+    state.refreshTimer = null;
+  }
+
+  state.isRefreshing = true;
+  await updatePanel();
+  api.v1.ui.toast('Refreshing analysis...', { type: 'info' });
+
+  state.refreshTimer = await api.v1.timers.setTimeout(async () => {
+    state.refreshTimer = null;
+    try {
+      await loadConfig();
+      await runAutoAnalysis(true, false);
+      api.v1.ui.toast('Analysis refreshed', { type: 'success' });
+
+      if (state.config.enableAutoCoaching && state.config.enableGeneralCoach) {
+        api.v1.timers.setTimeout(async () => {
+          try {
+            const scanned = await api.v1.document.scan();
+            if (scanned.length === 0) return;
+            const fullText = scanned.map(s => s.section.text).join('\\n');
+            const excerpt = fullText.length > state.config.tokenWindow * 4
+              ? fullText.slice(-(state.config.tokenWindow * 4))
+              : fullText;
+            state.autoGeneral = await coachGeneral(excerpt);
+            await updatePanel();
+          } catch (e) {
+            api.v1.error('Deferred general coach error:', e);
+          }
+        }, 0);
+      }
+    } catch (e) {
+      api.v1.error('Refresh callback error:', e);
+      api.v1.ui.toast('Refresh failed; check script log.', { type: 'error' });
+    } finally {
+      state.isRefreshing = false;
+      await updatePanel();
+    }
+  }, 0);
+}
+async function toggleAutoScan(): Promise<void> {
+  state.config.enableAutoScan = !state.config.enableAutoScan;
+  await api.v1.storage.set(STORAGE_ENABLE_AUTO_SCAN, state.config.enableAutoScan);
+
+  if (!state.config.enableAutoScan && state.generationDebounceTimer !== null) {
+    api.v1.timers.clearTimeout(state.generationDebounceTimer);
+    state.generationDebounceTimer = null;
+  }
+
+  if (!state.config.enableAutoScan) {
+    state.autoSdtFlags = [];
+    state.autoTagFlags = [];
+    state.autoAdverbFlags = [];
+    state.autoPassiveFlags = [];
+    state.autoGeneral = '';
+    resetFlagCoachState();
+  }
+
+  await updatePanel();
+  api.v1.ui.toast(
+    state.config.enableAutoScan ? 'Auto scan enabled' : 'Auto scan disabled',
+    { type: 'success' }
+  );
+}
+
+// ============================================================================
+// ZERO-COST PATTERN DETECTION
+// ============================================================================
+
+/**
+ * Split text into sentences, respecting closing quotes.
+ * Carries an optional quote state so section fragments that begin
+ * mid-dialogue do not expose quoted speech as narration.
+ */
+type ParsedSentence = {
+  sentence: string;
+  start: number;
+  startsInQuote: boolean;
+  endsInQuote: boolean;
+};
+
+function splitIntoSentencesDetailed(
+  text: string,
+  initialInQuote: boolean = false
+): { sentences: ParsedSentence[]; endsInQuote: boolean } {
+  const QUOTE_CHARS = new Set(['"', '\u201C', '\u201D']);
+  const sentences: ParsedSentence[] = [];
+  let current = '';
+  let currentStart = -1;
+  let currentStartsInQuote = initialInQuote;
+  let inQuote = initialInQuote;
+
+  const pushCurrent = () => {
+    const trimmed = current.replace(/\s+/g, ' ').trim();
+    if (trimmed.length > 12 && currentStart >= 0) {
+      sentences.push({
+        sentence: trimmed,
+        start: currentStart,
+        startsInQuote: currentStartsInQuote,
+        endsInQuote: inQuote
+      });
+    }
+    current = '';
+    currentStart = -1;
+    currentStartsInQuote = inQuote;
+  };
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (currentStart === -1) {
+      if (/\s/.test(ch)) continue;
+      currentStart = i;
+      currentStartsInQuote = inQuote;
+    }
+
+    if (ch === '\r' || ch === '\n') {
+      pushCurrent();
+      continue;
+    }
+
+    if (/\s/.test(ch)) {
+      if (current && !/\s$/.test(current)) current += ' ';
+      continue;
+    }
+
+    if (QUOTE_CHARS.has(ch)) {
+      if (inQuote) {
+        const prev = current.length > 0 ? current[current.length - 1] : '';
+        let j = i + 1;
+        while (j < text.length && /\s/.test(text[j])) j++;
+        if (/[.!?]/.test(prev) && j < text.length && /[A-Z\u201C\u201D"]/.test(text[j])) {
+          current += ch;
+          inQuote = false;
+          pushCurrent();
+          i = j - 1;
+          continue;
+        }
+      }
+      inQuote = !inQuote;
+      current += ch;
+      continue;
+    }
+
+    current += ch;
+
+    if (!inQuote && /[.!?]/.test(ch)) {
+      let j = i + 1;
+      let closingQuote = '';
+      if (j < text.length && QUOTE_CHARS.has(text[j])) {
+        closingQuote = text[j];
+        j++;
+      }
+      while (j < text.length && /\s/.test(text[j])) j++;
+      if (j < text.length && /[A-Z\u201C\u201D"]/.test(text[j])) {
+        if (closingQuote) current += closingQuote;
+        pushCurrent();
+        i = j - 1;
+      } else if (closingQuote) {
+        current += closingQuote;
+        i = j - 1;
+      }
+    }
+  }
+
+  pushCurrent();
+
+  return { sentences, endsInQuote: inQuote };
+}
+
+function splitIntoSentencesWithState(
+  text: string,
+  initialInQuote: boolean = false
+): { sentences: string[]; endsInQuote: boolean } {
+  const result = splitIntoSentencesDetailed(text, initialInQuote);
+  return {
+    sentences: result.sentences.map(s => s.sentence),
+    endsInQuote: result.endsInQuote
+  };
+}
+
+function splitIntoSentences(text: string): string[] {
+  return splitIntoSentencesWithState(text).sentences;
+}
+
+function normalizeForContextMatch(text: string): string {
+  return text.replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function getSingleLineContext(target: string, source: string, fallback: string): string {
+  const normalizedTarget = normalizeForContextMatch(target);
+  if (!normalizedTarget) return fallback.trim();
+
+  for (const rawLine of source.split(/\r\n|\r|\n/)) {
+    const line = rawLine.replace(/\s+/g, ' ').trim();
+    if (!line) continue;
+    const normalizedLine = normalizeForContextMatch(line);
+    if (normalizedLine.includes(normalizedTarget)) {
+      return line.length > 700 ? '...' + line.slice(-700) : line;
+    }
+  }
+
+  return fallback.trim();
+}
+
+function rawIndexFromNormalizedIndex(raw: string, normalizedIndex: number): number {
+  if (normalizedIndex <= 0) return 0;
+
+  let rawIndex = 0;
+  let normalizedCursor = 0;
+  let inWhitespace = false;
+
+  while (rawIndex < raw.length) {
+    const ch = raw[rawIndex];
+    if (/\s/.test(ch)) {
+      if (!inWhitespace && normalizedCursor > 0) {
+        if (normalizedCursor >= normalizedIndex) return rawIndex;
+        normalizedCursor += 1;
+      }
+      inWhitespace = true;
+      rawIndex += 1;
+      continue;
+    }
+
+    inWhitespace = false;
+    if (normalizedCursor >= normalizedIndex) return rawIndex;
+    normalizedCursor += 1;
+    rawIndex += 1;
+  }
+
+  return raw.length;
+}
+
+function getSentencePositionInLine(line: string, sentence: string): number {
+  const direct = line.indexOf(sentence);
+  if (direct >= 0) return direct;
+
+  const normalizedLine = normalizeForContextMatch(line);
+  const normalizedSentence = normalizeForContextMatch(sentence);
+  if (!normalizedSentence) return -1;
+
+  let normalizedIndex = normalizedLine.indexOf(normalizedSentence);
+  if (normalizedIndex === -1) {
+    const probe = normalizedSentence.slice(0, Math.min(normalizedSentence.length, 48));
+    if (!probe) return -1;
+    normalizedIndex = normalizedLine.indexOf(probe);
+    if (normalizedIndex === -1) return -1;
+  }
+
+  return rawIndexFromNormalizedIndex(line, normalizedIndex);
+}
+
+function getParagraphContextAt(source: string, absoluteIndex: number, fallback: string, paragraphCount: number): string {
+  if (absoluteIndex < 0 || absoluteIndex > source.length) return fallback.trim();
+
+  const paragraphs = source.split(/\r\n|\r|\n/);
+  let cursor = 0;
+  let currentIndex = -1;
+  for (let index = 0; index < paragraphs.length; index += 1) {
+    const paragraphEnd = cursor + paragraphs[index].length;
+    if (absoluteIndex <= paragraphEnd) {
+      currentIndex = index;
+      break;
+    }
+    const separatorLength = source.slice(paragraphEnd).match(/^\r\n|^\r|^\n/)?.[0].length ?? 0;
+    cursor = paragraphEnd + separatorLength;
+  }
+
+  if (currentIndex < 0) return fallback.trim();
+
+  const count = Math.max(1, Math.floor(paragraphCount || 1));
+  const paragraphsBehind = Math.floor(count / 2);
+  const paragraphsAhead = Math.ceil((count - 1) / 2);
+  const start = Math.max(0, currentIndex - paragraphsBehind);
+  const end = Math.min(paragraphs.length - 1, currentIndex + paragraphsAhead);
+  const context = paragraphs
+    .slice(start, end + 1)
+    .map((paragraph) => {
+      const normalized = paragraph.replace(/\s+/g, ' ').trim();
+      return normalized.length > 700 ? '...' + normalized.slice(-700) : normalized;
+    })
+    .filter(Boolean)
+    .join('\n\n');
+
+  return context || fallback.trim();
+}
+
+/**
+ * Remove all quoted dialogue spans from a sentence, leaving only narration.
+ * Handles both straight quotes and curly quotes.
+ * e.g. `She smiled. "I felt happy," she said, feeling nervous.`
+ *   -> `She smiled.  she said, feeling nervous.`
+ * The narration remainder is what we scan for tells and what we pass to the AI.
+ */
+function stripDialogue(sentence: string): string {
+  // NovelAI and various editors use different quote character combinations.
+  // Cover every pairing: straight/straight, curly-open/curly-close,
+  // curly-open/straight, straight/curly-close, and curly-open/curly-open
+  // (some editors reuse \u201C for both open and close).
+  return sentence
+    .replace(/\u201C[^\u201C\u201D"]*\u201D/g, ' ')  // "proper" curly pair
+    .replace(/\u201C[^\u201C\u201D"]*\u201C/g, ' ')  // open/open (reused open as close)
+    .replace(/\u201C[^\u201C\u201D"]*"/g, ' ')        // curly-open + straight-close
+    .replace(/"[^\u201C\u201D"]*\u201D/g, ' ')        // straight-open + curly-close
+    .replace(/"[^"]*"/g, ' ')                          // straight/straight
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+// Pronoun set used for attribution tag detection
+const ATTRIBUTION_PRONOUNS = new Set([
+  'he', 'she', 'they', 'it', 'i', 'we', 'you',
+  'her', 'him', 'them', 'his', 'its'
+]);
+
+/**
+ * Extract only the narration portions of a sentence — everything outside quotes.
+ * Returns the stripped text and whether anything substantial remains.
+ */
+/**
+ * Tokenize a sentence into alternating narration and dialogue spans.
+ * Returns only the narration spans concatenated, plus a substance check.
+ *
+ * Works by scanning character by character, tracking whether we're inside
+ * a quoted span. Handles unclosed quotes (e.g. truncated sentences) by
+ * treating everything from an unclosed opening quote to end-of-string as dialogue.
+ */
+function getNarration(sentence: string): { text: string; hasSubstance: boolean } {
+  // Only double-quote variants — single curly quotes are apostrophes in contractions
+  const QUOTE_CHARS = new Set(['"', '\u201C', '\u201D']);
+  let inQuote = false;
+  let narrationParts: string[] = [];
+  let current = '';
+
+  for (let i = 0; i < sentence.length; i++) {
+    const ch = sentence[i];
+    if (QUOTE_CHARS.has(ch)) {
+      if (!inQuote) {
+        // Entering a quote — save narration so far
+        if (current.trim()) narrationParts.push(current);
+        current = '';
+        inQuote = true;
+      } else {
+        // Closing a quote — discard the dialogue span, start collecting narration
+        current = '';
+        inQuote = false;
+      }
+    } else {
+      if (!inQuote) {
+        current += ch;
+      }
+      // Inside quote: discard
+    }
+  }
+  // Anything left after the loop (including unclosed quotes: inQuote=true means
+  // we were still inside dialogue at end-of-string — discard it)
+  if (!inQuote && current.trim()) narrationParts.push(current);
+
+  const narration = narrationParts.join(' ').replace(/\s{2,}/g, ' ').trim();
+
+  // Strip punctuation-only residue and count meaningful words
+  const words = narration.toLowerCase().replace(/[^a-z\s]/g, '').trim().split(/\s+/).filter(Boolean);
+  const meaningful = words.filter(w =>
+    !ATTRIBUTION_PRONOUNS.has(w) &&
+    !EXPLANATORY_TAG_VERBS.has(w) &&
+    !ATTRIBUTION_ADVERBS.has(w) &&
+    w.length > 1
+  );
+
+  return {
+    text: narration,
+    hasSubstance: meaningful.length >= 3
+  };
+}
+
+function countQuoteChars(text: string): number {
+  const matches = text.match(/["\u201C\u201D]/g);
+  return matches ? matches.length : 0;
+}
+
+function endsWithQuote(text: string): boolean {
+  return /["\u201D]\s*$/.test(text);
+}
+
+function getNarrationWithState(
+  sentence: string,
+  startsInQuote: boolean
+): { text: string; hasSubstance: boolean } {
+  const QUOTE_CHARS = new Set(['"', '\u201C', '\u201D']);
+  let inQuote = startsInQuote;
+  const narrationParts: string[] = [];
+  let current = '';
+
+  for (let i = 0; i < sentence.length; i++) {
+    const ch = sentence[i];
+    if (QUOTE_CHARS.has(ch)) {
+      if (!inQuote && current.trim()) narrationParts.push(current);
+      current = '';
+      inQuote = !inQuote;
+      continue;
+    }
+
+    if (!inQuote) current += ch;
+  }
+
+  if (!inQuote && current.trim()) narrationParts.push(current);
+
+  const narration = narrationParts.join(' ').replace(/\s{2,}/g, ' ').trim();
+  const words = narration.toLowerCase().replace(/[^a-z\s]/g, '').trim().split(/\s+/).filter(Boolean);
+  const meaningful = words.filter(w =>
+    !ATTRIBUTION_PRONOUNS.has(w) &&
+    !EXPLANATORY_TAG_VERBS.has(w) &&
+    !ATTRIBUTION_ADVERBS.has(w) &&
+    w.length > 1
+  );
+
+  return {
+    text: narration,
+    hasSubstance: meaningful.length >= 3
+  };
+}
+
+function findAnalysisStart(fullText: string, analysisText: string): number {
+  if (!analysisText) return Math.max(0, fullText.length);
+  const direct = fullText.lastIndexOf(analysisText);
+  if (direct >= 0) return direct;
+
+  const normalizedAnalysis = analysisText.replace(/^\s+/, '');
+  if (!normalizedAnalysis) return Math.max(0, fullText.length - analysisText.length);
+  const normalizedDirect = fullText.lastIndexOf(normalizedAnalysis);
+  if (normalizedDirect >= 0) return normalizedDirect;
+
+  const tail = normalizedAnalysis.slice(0, Math.min(normalizedAnalysis.length, 200));
+  const tailIndex = fullText.lastIndexOf(tail);
+  if (tailIndex >= 0) return tailIndex;
+
+  return Math.max(0, fullText.length - analysisText.length);
+}
+type DetectionSentence = {
+  sentence: string;
+  sectionStartsInDialogue: boolean;
+  hasAnyQuote: boolean;
+  startsWithQuote: boolean;
+  hasNarrationBeforeQuote: boolean;
+  lineContext: string;
+  lineStartsInDialogue: boolean;
+  narration: string;
+  hasSubstance: boolean;
+};
+
+let detectionSentenceCacheKey = '';
+let detectionSentenceCache: DetectionSentence[] = [];
+
+function getDetectionSentences(
+  text: string,
+  initialInQuote: boolean = false,
+  sourceText?: string,
+  sourceOffset: number = 0
+): DetectionSentence[] {
+  const cacheKey = `${sourceOffset}|${initialInQuote ? 1 : 0}|${text.length}|${sourceText?.length ?? -1}|${text}|${sourceText ?? ''}`;
+  if (detectionSentenceCacheKey === cacheKey) return detectionSentenceCache;
+
+  const parsed = splitIntoSentencesDetailed(text, initialInQuote);
+  const sentences = parsed.sentences;
+  const analyzed: DetectionSentence[] = [];
+  let inQuoteAcrossSentences = initialInQuote;
+  let searchStart = 0;
+
+  for (const parsedSentence of sentences) {
+    const sentence = parsedSentence.sentence;
+    const localIndex = parsedSentence.start;
+    searchStart = localIndex + sentence.length;
+    const absoluteIndex = sourceOffset + localIndex;
+    const sourceStartsInDialogue = absoluteIndex >= 0 && sourceText
+      ? countQuoteChars(sourceText.slice(0, absoluteIndex)) % 2 === 1
+      : undefined;
+
+    const trimmedSentence = sentence.trimStart();
+    const hasAnyQuote = /["\u201C\u201D]/.test(sentence);
+    const startsWithQuote = /^["\u201C\u201D]/.test(trimmedSentence);
+    const firstQuoteIndex = sentence.search(/["\u201C\u201D]/);
+    const hasNarrationBeforeQuote = firstQuoteIndex > 0 && sentence.slice(0, firstQuoteIndex).trim().length > 0;
+    const sectionStartsInDialogue = startsWithQuote
+      ? true
+      : hasAnyQuote && hasNarrationBeforeQuote
+        ? false
+        : parsedSentence.startsInQuote;
+    const quoteCount = countQuoteChars(sentence);
+    const sectionEndsInDialogue = sectionStartsInDialogue ? quoteCount % 2 === 0 : quoteCount % 2 === 1;
+    inQuoteAcrossSentences = sectionEndsInDialogue;
+
+    const lineContext = absoluteIndex >= 0 && sourceText
+      ? getParagraphContextAt(sourceText, absoluteIndex, sentence, state.config.contextParagraphs)
+      : getSingleLineContext(sentence, sourceText ?? text, sentence);
+    const currentParagraphStart = absoluteIndex >= 0 && sourceText
+      ? Math.max(
+        0,
+        Math.max(
+          sourceText.lastIndexOf('\n', Math.max(0, absoluteIndex - 1)),
+          sourceText.lastIndexOf('\r', Math.max(0, absoluteIndex - 1))
+        ) + 1
+      )
+      : 0;
+    const sentencePosInLine = absoluteIndex >= 0 && sourceText
+      ? absoluteIndex - currentParagraphStart
+      : getSentencePositionInLine(lineContext, sentence);
+    const lineStartsInDialogue = sentencePosInLine > 0
+      ? sourceText
+        ? countQuoteChars(sourceText.slice(currentParagraphStart, absoluteIndex)) % 2 === 1
+        : countQuoteChars(lineContext.slice(0, sentencePosInLine)) % 2 === 1
+      : false;
+
+    const { text: narration, hasSubstance } = getNarrationWithState(sentence, sectionStartsInDialogue);
+    analyzed.push({
+      sentence,
+      sectionStartsInDialogue,
+      hasAnyQuote,
+      startsWithQuote,
+      hasNarrationBeforeQuote,
+      lineContext,
+      lineStartsInDialogue,
+      narration,
+      hasSubstance
+    });
+  }
+
+  detectionSentenceCacheKey = cacheKey;
+  detectionSentenceCache = analyzed;
+  return analyzed;
+}
+
+/**
+ * Detect telling/filter-verb sentences in a block of text.
+ * Only flags sentences where the trigger word appears in the narration portion,
+ * not inside dialogue quotes. Skips sentences that are pure dialogue + attribution tag.
+ */
+function detectSdtFlags(
+  text: string,
+  sections?: string[],
+  initialInQuote: boolean = false,
+  sourceText?: string,
+  sourceOffset: number = 0
+): SdtFlag[] {
+  const candidates: SdtFlag[] = [];
+  const analyzedSentences = getDetectionSentences(text, initialInQuote, sourceText, sourceOffset);
+
+  for (const analyzed of analyzedSentences) {
+    const { sentence, sectionStartsInDialogue, hasAnyQuote, startsWithQuote, hasNarrationBeforeQuote, lineContext, lineStartsInDialogue, narration, hasSubstance } = analyzed;
+
+    if ((lineStartsInDialogue && !startsWithQuote) || (sectionStartsInDialogue && !hasNarrationBeforeQuote) || (!hasNarrationBeforeQuote && endsWithQuote(sentence))) {
+      continue;
+    }
+
+    if (!hasSubstance) continue;
+
+    // Only scan the narration portion for trigger words
+    const narrationLower = narration.toLowerCase();
+    const words = narrationLower.split(/\b/);
+    const sentenceCandidates: SdtFlag[] = [];
+
+    for (const word of words) {
+      const clean = word.replace(/[^a-z]/g, '');
+      if (!clean) continue;
+
+      let type: SdtFlag['type'] | null = null;
+      if (FILTER_VERBS.has(clean)) type = 'filter_verb';
+      else if (TELLING_WORDS.has(clean)) type = 'telling_word';
+      else if (REACTION_TELLS.has(clean)) type = 'reaction_tell';
+      if (!type) continue;
+
+      const score = scoreSdtCandidate(clean, type, narration);
+      if (score < 2.0) continue;
+
+      sentenceCandidates.push({
+        sentence: sentence.trim(),
+        narration: narration.trim(),
+        context: lineContext,
+        word: clean,
+        type,
+        score
+      });
+    }
+
+    // Keep only the strongest issue per sentence so one noisy sentence doesn't
+    // consume the whole sidebar.
+    if (sentenceCandidates.length > 0) {
+      sentenceCandidates.sort((a, b) => b.score - a.score);
+      candidates.push(sentenceCandidates[0]);
+    }
+  }
+
+  // Rank globally, dedupe repeated categories a little, then return the top five.
+  const ranked = candidates.sort((a, b) => b.score - a.score);
+  const finalFlags: SdtFlag[] = [];
+  const categoryCounts = new Map<string, number>();
+  for (const flag of ranked) {
+    const count = categoryCounts.get(flag.type) ?? 0;
+    if (count >= 3) continue;
+    finalFlags.push(flag);
+    categoryCounts.set(flag.type, count + 1);
+    if (finalFlags.length >= 5) break;
+  }
+
+  return finalFlags;
+}
+
+/**
+ * Detect explanatory action tags adjacent to dialogue.
+ * Looks for: sentence near a quote that contains a tag verb + optional adverb.
+ */
+function detectTagFlags(
+  text: string,
+  sections?: string[],
+  initialInQuote: boolean = false,
+  sourceText?: string,
+  sourceOffset: number = 0
+): TagFlag[] {
+  const candidates: TagFlag[] = [];
+  const analyzedSentences = getDetectionSentences(text, initialInQuote, sourceText, sourceOffset);
+
+  for (const analyzed of analyzedSentences) {
+    const { sentence, sectionStartsInDialogue, hasAnyQuote: hasQuote, startsWithQuote, hasNarrationBeforeQuote, lineStartsInDialogue, narration, hasSubstance } = analyzed;
+
+    if (!hasQuote) continue;
+    if ((lineStartsInDialogue && !startsWithQuote) || (sectionStartsInDialogue && !hasNarrationBeforeQuote) || (!hasNarrationBeforeQuote && endsWithQuote(sentence))) {
+      continue;
+    }
+
+    if (!hasSubstance) continue;
+
+    const words = narration.toLowerCase().split(/\s+/);
+    let tagVerb: string | null = null;
+    let adverb: string | null = null;
+
+    for (const raw of words) {
+      const clean = raw.replace(/[^a-z]/g, '');
+      if (!clean) continue;
+      if (EXPLANATORY_TAG_VERBS.has(clean) && !tagVerb) tagVerb = clean;
+      if (ATTRIBUTION_ADVERBS.has(clean) && tagVerb) adverb = clean;
+    }
+
+    if (tagVerb) {
+      const score = scoreTagCandidate(tagVerb, adverb, narration);
+      if (score < 1.5) continue;
+      const type = adverb ? 'adverb_tag' : 'explanatory_tag';
+      const word = adverb ? `${tagVerb} + ${adverb}` : tagVerb;
+      candidates.push({ sentence: sentence.trim(), word, type, score });
+    }
+  }
+
+  return candidates
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 4);
+}
+
+const ADVERB_EXCLUSIONS = new Set([
+  'only', 'early', 'likely', 'lovely', 'lonely', 'friendly', 'family',
+  'holy', 'silly', 'ugly', 'daily', 'weekly', 'monthly', 'yearly',
+  'nearly', 'barely', 'hardly', 'really', 'actually', 'usually'
+]);
+
+function detectAdverbFlags(
+  text: string,
+  sections?: string[],
+  initialInQuote: boolean = false,
+  sourceText?: string,
+  sourceOffset: number = 0
+): AdverbFlag[] {
+  const candidates: AdverbFlag[] = [];
+  const analyzedSentences = getDetectionSentences(text, initialInQuote, sourceText, sourceOffset);
+
+  for (const analyzed of analyzedSentences) {
+    const { sentence, sectionStartsInDialogue, hasAnyQuote, startsWithQuote, hasNarrationBeforeQuote, lineContext, lineStartsInDialogue, narration, hasSubstance } = analyzed;
+
+    if ((lineStartsInDialogue && !startsWithQuote) || (sectionStartsInDialogue && !hasNarrationBeforeQuote) || (!hasNarrationBeforeQuote && endsWithQuote(sentence))) {
+      continue;
+    }
+
+    if (!hasSubstance) continue;
+
+    const words = narration.toLowerCase().match(/\b[a-z]+\b/g) ?? [];
+    for (const word of words) {
+      if (!word.endsWith('ly') || word.length < 6 || ADVERB_EXCLUSIONS.has(word)) continue;
+      const score = ATTRIBUTION_ADVERBS.has(word) ? 3.0 : 2.4;
+      candidates.push({
+        sentence: narration.trim(),
+        narration: narration.trim(),
+        context: lineContext,
+        word,
+        score
+      });
+      break;
+    }
+  }
+
+  return candidates
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+}
+
+const PASSIVE_HELPERS = new Set([
+  'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'get', 'gets', 'got'
+]);
+
+const PASSIVE_EXCLUSIONS = new Set([
+  'afraid', 'alive', 'alone', 'asleep', 'awake', 'aware', 'back', 'born',
+  'broken', 'busy', 'dead', 'done', 'drunk', 'finished', 'gone', 'happy',
+  'hurt', 'lost', 'married', 'open', 'pleased', 'ready', 'relieved', 'scared',
+  'shut', 'sick', 'stuck', 'sure', 'tired', 'upset', 'worried'
+]);
+
+const STRONG_IRREGULAR_PARTICIPLES = new Set([
+  'beaten', 'bitten', 'bound', 'brought', 'built', 'caught', 'chosen',
+  'dragged', 'drawn', 'driven', 'eaten', 'found', 'given', 'held', 'hidden',
+  'kept', 'known', 'left', 'made', 'sent', 'shown', 'taken', 'taught',
+  'thrown', 'told', 'written'
+]);
+
+function isLikelyPassiveParticiple(word: string): boolean {
+  if (PASSIVE_EXCLUSIONS.has(word)) return false;
+  return word.endsWith('ed') || word.endsWith('en') || STRONG_IRREGULAR_PARTICIPLES.has(word);
+}
+
+function detectPassiveFlags(
+  text: string,
+  sections?: string[],
+  initialInQuote: boolean = false,
+  sourceText?: string,
+  sourceOffset: number = 0
+): PassiveFlag[] {
+  const candidates: PassiveFlag[] = [];
+  const analyzedSentences = getDetectionSentences(text, initialInQuote, sourceText, sourceOffset);
+
+  for (const analyzed of analyzedSentences) {
+    const { sentence, sectionStartsInDialogue, hasAnyQuote, startsWithQuote, hasNarrationBeforeQuote, lineContext, lineStartsInDialogue, narration, hasSubstance } = analyzed;
+
+    if ((lineStartsInDialogue && !startsWithQuote) || (sectionStartsInDialogue && !hasNarrationBeforeQuote) || (!hasNarrationBeforeQuote && endsWithQuote(sentence))) {
+      continue;
+    }
+
+    if (!hasSubstance) continue;
+
+    const words = narration.toLowerCase().match(/\b[a-z]+\b/g) ?? [];
+    for (let i = 0; i < words.length - 1; i++) {
+      if (!PASSIVE_HELPERS.has(words[i])) continue;
+
+      let j = i + 1;
+      if (words[j] === 'not') j++;
+      if (words[j] === 'being') j++;
+      const participle = words[j];
+      if (!participle || !isLikelyPassiveParticiple(participle)) continue;
+
+      const phraseWords = words.slice(i, j + 1);
+      const phrase = phraseWords.join(' ');
+      const nearby = words.slice(j + 1, Math.min(words.length, j + 5));
+      let score = STRONG_IRREGULAR_PARTICIPLES.has(participle) ? 2.0 : 1.6;
+      if (nearby.includes('by')) score += 0.9;
+      if (words[i] === 'being' || phrase.includes('being')) score += 0.3;
+      if (words[i] === 'get' || words[i] === 'gets' || words[i] === 'got') score -= 0.2;
+
+      candidates.push({
+        sentence: narration.trim(),
+        narration: narration.trim(),
+        context: lineContext,
+        phrase,
+        score
+      });
+      break;
+    }
+  }
+
+  return candidates
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 4);
+}
+
+// ============================================================================
+// AI COACHING CALLS// ============================================================================
+// AI COACHING CALLS
+// ============================================================================
+
+const MAX_COACH_LOREBOOK_ENTRIES = 8;
+const MAX_COACH_LOREBOOK_CHARS = 6000;
+
+async function getActivatedLorebookContext(sourceText: string): Promise<string> {
+  const normalizedSource = normalizeForContextMatch(sourceText);
+  if (!normalizedSource) return '';
+
+  try {
+    const entries = await api.v1.lorebook.entries();
+    const activated = entries.filter((entry) => {
+      if (entry.enabled === false || !entry.text?.trim()) return false;
+      if (entry.forceActivation === true) return true;
+
+      return (entry.keys ?? []).some((rawKey) => {
+        const keyParts = rawKey
+          .split('&')
+          .map((part) => normalizeForContextMatch(part))
+          .filter(Boolean);
+        return keyParts.length > 0 && keyParts.every((part) => normalizedSource.includes(part));
+      });
+    }).slice(0, MAX_COACH_LOREBOOK_ENTRIES);
+
+    let remainingChars = MAX_COACH_LOREBOOK_CHARS;
+    const blocks: string[] = [];
+    for (const entry of activated) {
+      if (remainingChars <= 0) break;
+      const text = entry.text?.trim() ?? '';
+      const block = `[${entry.displayName ?? 'Lorebook entry'}]\n${text}`;
+      const boundedBlock = block.length > remainingChars
+        ? block.slice(0, remainingChars).trimEnd() + '\n[entry truncated]'
+        : block;
+      blocks.push(boundedBlock);
+      remainingChars -= boundedBlock.length;
+    }
+
+    return blocks.length > 0
+      ? `\n\nACTIVATED LOREBOOK REFERENCE (background context only):\n${blocks.join('\n\n')}`
+      : '';
+  } catch (error) {
+    api.v1.error('Lorebook activation lookup failed:', error);
+    return '';
+  }
+}
+
+/**
+ * Run show-don't-tell coaching on selected text. Returns formatted feedback.
+ */
+function buildTargetContextBlock(target: string, context?: string): string {
+  const cleanTarget = target.trim();
+  const cleanContext = (context || '').trim();
+  if (!cleanContext || normalizeForContextMatch(cleanContext) === normalizeForContextMatch(cleanTarget)) {
+    return `TARGET SENTENCE (revise only this sentence):\n${cleanTarget}`;
+  }
+  return `TARGET SENTENCE (revise only this sentence):\n${cleanTarget}\n\nLOCAL CONTEXT (for meaning only; do not revise text outside the target sentence):\n${cleanContext}`;
+}
+
+async function generateWithBudgetWait(
+  messages: Array<{ role: 'user' | 'assistant' | 'system'; content: string }>,
+  parameters: { model: string; max_tokens?: number; temperature?: number; stop?: string[]; [key: string]: any },
+  onStream?: any,
+  behaviour?: any
+): Promise<any> {
+  const requiredInput = Math.max(1, await api.v1.script.countUncachedInputTokens(messages, parameters.model));
+  const requiredOutput = Math.max(1, parameters.max_tokens ?? 1);
+
+  while (true) {
+    const allowedInput = api.v1.script.getAllowedInput();
+    const allowedOutput = api.v1.script.getAllowedOutput();
+    if (allowedInput >= requiredInput && allowedOutput >= requiredOutput) break;
+
+    if (allowedInput < requiredInput) {
+      await api.v1.script.waitForAllowedInput(requiredInput);
+      continue;
+    }
+
+    if (allowedOutput < requiredOutput) {
+      await api.v1.script.waitForAllowedOutput(requiredOutput);
+    }
+  }
+
+  return await api.v1.generate(messages, parameters, onStream, behaviour);
+}
+async function coachSdt(passage: string, triggerWord?: string, flagType?: string, context?: string): Promise<string> {
+  // Selection context: multi-paragraph passage — use the broader SDT prompt
+  // Auto-detection context: single narration sentence — use the targeted prompt
+  const isSelection = flagType === 'selection';
+  const selectionPrompt = "You are a surgical prose coach. The writer has selected this passage. Identify 1-2 specific sentences that TELL emotion or quality instead of SHOWING it through physical detail. For each, quote the exact sentence, name the telling word or phrase, then give a single revised sentence that shows the same thing through specific sensory detail. Be direct and surgical — no preamble. Format: SENTENCE: [quote] | ISSUE: [word/phrase] | REVISION: [rewrite]";
+  const basePrompt = isSelection ? selectionPrompt :
+                     flagType === 'reaction_tell' ? state.config.reactionPrompt :
+                     state.config.sdtPrompt;
+  const ban = triggerWord
+    ? `\n\nIMPORTANT: The revision must NOT contain the word "${triggerWord}" or any of its forms. Find a way to show the same thing without using that word at all.`
+    : '';
+  const passageBlock = isSelection ? `PASSAGE:\n${passage}` : buildTargetContextBlock(passage, context);
+  const lorebookContext = await getActivatedLorebookContext(`${passage}\n${context ?? ''}`);
+  const prompt = `${basePrompt}${ban}\n\n${passageBlock}${lorebookContext}`;
+
+  try {
+    const response = await generateWithBudgetWait(
+      [{ role: 'user', content: prompt }],
+      {
+        model: 'glm-4-6',
+        max_tokens: isSelection ? 500 : 300,
+        temperature: state.config.temperature,
+        stop: ['\n\n\n']
+      },
+      undefined,
+      'background'
+    );
+
+    if (!response.choices || response.choices.length === 0) return '(No response)';
+    return response.choices[0].text.trim();
+  } catch (e) {
+    api.v1.error('SDT coach error:', e);
+    return '(Error generating coaching)';
+  }
+}
+
+/**
+ * Run action tag coaching on selected text. Returns formatted feedback.
+ */
+
+/**
+ * Run paragraph-level SDT cluster coaching when several nearby flags point to the same pattern.
+ * This fixes the repeated pattern instead of mechanically removing one word.
+ */
+async function coachSdtCluster(passage: string, words: string[], flagType: string): Promise<string> {
+  const label = flagType === 'filter_verb' ? 'filter/cognition tells' :
+                flagType === 'reaction_tell' ? 'reaction tells' :
+                'telling words';
+  const wordList = words.join(', ');
+  const lorebookContext = await getActivatedLorebookContext(passage);
+  const prompt = `You are a surgical prose coach. The following passage contains multiple related ${label}: ${wordList}.
+
+Rewrite the passage to reduce the overall repeated pattern while preserving meaning, tone, POV, sequence, and voice. Do not mechanically remove every flagged word if one is truly needed, but replace the cluster with concrete action, sensory detail, sharper interiority, or cleaner sentence structure where possible.
+
+IMPORTANT:
+- TARGET must be copied EXACTLY from the passage below.
+- REVISION should replace the entire TARGET passage.
+- You may combine, split, or restructure sentences if needed.
+- Do not invent new story facts.
+
+Format:
+TARGET: [exact passage copied verbatim]
+ISSUE: [one sentence naming the repeated pattern]
+REVISION: [revised passage]
+
+PASSAGE:
+${passage}${lorebookContext}`;
+
+  try {
+    const response = await generateWithBudgetWait(
+      [{ role: 'user', content: prompt }],
+      {
+        model: 'glm-4-6',
+        max_tokens: 420,
+        temperature: state.config.temperature,
+        stop: ['\n\n\n']
+      },
+      undefined,
+      'background'
+    );
+
+    if (!response.choices || response.choices.length === 0) return '(No response)';
+    return response.choices[0].text.trim();
+  } catch (e) {
+    api.v1.error('SDT cluster coach error:', e);
+    return '(Error generating coaching)';
+  }
+}
+
+async function coachTags(passage: string): Promise<string> {
+  const lorebookContext = await getActivatedLorebookContext(passage);
+  const prompt = `${state.config.tagPrompt}\n\nPASSAGE:\n${passage}${lorebookContext}`;
+
+  try {
+    const response = await generateWithBudgetWait(
+      [{ role: 'user', content: prompt }],
+      {
+        model: 'glm-4-6',
+        max_tokens: 300,
+        temperature: state.config.temperature,
+        stop: ['\n\n\n']
+      },
+      undefined,
+      'background'
+    );
+
+    if (!response.choices || response.choices.length === 0) return '(No response)';
+    return response.choices[0].text.trim();
+  } catch (e) {
+    api.v1.error('Tag coach error:', e);
+    return '(Error generating coaching)';
+  }
+}
+
+async function coachAdverb(passage: string, adverb: string, context?: string): Promise<string> {
+  const lorebookContext = await getActivatedLorebookContext(`${passage}\n${context ?? ''}`);
+  const prompt = `You are a surgical prose coach. The target narration sentence uses the adverb "${adverb}". Use the local context to understand meaning, but give one revised sentence for the target only. Explain what the adverb is trying to add, then strengthen the verb or action so the adverb is unnecessary. Preserve meaning, POV, and tone. Be direct and surgical — no preamble. Format: ISSUE: [adverb and what it is doing] | REVISION: [rewrite]\n\n${buildTargetContextBlock(passage, context)}${lorebookContext}`;
+
+  try {
+    const response = await generateWithBudgetWait(
+      [{ role: 'user', content: prompt }],
+      {
+        model: 'glm-4-6',
+        max_tokens: 300,
+        temperature: state.config.temperature,
+        stop: ['\n\n\n']
+      },
+      undefined,
+      'background'
+    );
+
+    if (!response.choices || response.choices.length === 0) return '(No response)';
+    return response.choices[0].text.trim();
+  } catch (e) {
+    api.v1.error('Adverb coach error:', e);
+    return '(Error generating coaching)';
+  }
+}
+
+async function coachPassive(passage: string, phrase: string, context?: string): Promise<string> {
+  const lorebookContext = await getActivatedLorebookContext(`${passage}\n${context ?? ''}`);
+  const prompt = `You are a surgical prose coach. The target narration sentence may use passive voice in "${phrase}". Use the local context to understand meaning, but give one revised sentence for the target only. Explain whether the passive construction weakens the sentence, then give one active-voice revision only if the active version preserves POV, agency, mystery, and emphasis. If passive voice is better here, say so and keep the revision close. Be direct and surgical â€” no preamble. Format: ISSUE: [passive phrase and effect] | REVISION: [rewrite]\n\n${buildTargetContextBlock(passage, context)}${lorebookContext}`;
+
+  try {
+    const response = await generateWithBudgetWait(
+      [{ role: 'user', content: prompt }],
+      {
+        model: 'glm-4-6',
+        max_tokens: 300,
+        temperature: state.config.temperature,
+        stop: ['\n\n\n']
+      },
+      undefined,
+      'background'
+    );
+
+    if (!response.choices || response.choices.length === 0) return '(No response)';
+    return response.choices[0].text.trim();
+  } catch (e) {
+    api.v1.error('Passive coach error:', e);
+    return '(Error generating coaching)';
+  }
+}
+
+/**
+ * Three-part general coach: craft note, line to strengthen, story musing.
+ * Fires three small focused calls rather than one multi-part call, so each
+ * part gets a clear instruction and reliable output.
+ */
+async function coachGeneral(passage: string): Promise<string> {
+  const excerpt = passage.length > 1200 ? '...' + passage.slice(-1200) : passage;
+  const lorebookContext = await getActivatedLorebookContext(excerpt);
+
+  const callGen = async (prompt: string, maxTokens: number): Promise<string> => {
+    try {
+      const response = await generateWithBudgetWait(
+        [{ role: 'user', content: prompt }],
+        { model: 'glm-4-6', max_tokens: maxTokens, temperature: 1.0, stop: ['\n\n'] },
+        undefined,
+        'background'
+      );
+      if (!response.choices || response.choices.length === 0) return '';
+      return response.choices[0].text.trim();
+    } catch (e) {
+      api.v1.error('General coach error:', e);
+      return '';
+    }
+  };
+
+  const craftPrompt = `You are a prose coach. In ONE sentence only, give the single most useful craft observation about this passage — pacing, rhythm, texture, or structure. No preamble.\n\nPASSAGE:\n${excerpt}${lorebookContext}`;
+  const strengthenPrompt = `You are a prose coach. In ONE sentence only, either quote or closely paraphrase one specific sentence from the passage below that could be strengthened and briefly say why — or write exactly: Nothing stands out. No preamble.\n\nPASSAGE:\n${excerpt}${lorebookContext}`;
+  const musingPrompt = `You are a prose coach. In ONE sentence only, offer a purely speculative imaginative musing about what might be happening in the larger story or world hinted at by this passage. Do not comment on craft. No preamble.\n\nPASSAGE:\n${excerpt}${lorebookContext}`;
+
+  // Run sequentially — parallel background calls may silently drop results
+  const craft = await callGen(craftPrompt, 80);
+  const strengthen = await callGen(strengthenPrompt, 80);
+  const musing = await callGen(musingPrompt, 80);
+
+  return [craft, strengthen, musing].filter(Boolean).join('\n');
+}
+
+async function coachGeneralRevision(generalLine: string, passage: string): Promise<string> {
+  const excerptSource = pickSingleLineContext(generalLine, passage);
+  const excerpt = excerptSource.length > 1200 ? '...' + excerptSource.slice(-1200) : excerptSource;
+  const lorebookContext = await getActivatedLorebookContext(excerpt);
+  const prompt = `You are a surgical prose coach. The writer received this note about a sentence that could be strengthened:\n${generalLine}\n\nFrom the passage context below, identify the exact sentence being referred to, explain the issue briefly, and give one revised sentence that preserves the story facts and tone. Be direct and surgical. Output exactly in this format, one item per line:\nTARGET: [exact sentence copied verbatim from the passage]\nISSUE: [brief reason]\nREVISION: [one revised sentence]\n\nPASSAGE:\n${excerpt}${lorebookContext}`;
+
+  try {
+    const response = await generateWithBudgetWait(
+      [{ role: 'user', content: prompt }],
+      {
+        model: 'glm-4-6',
+        max_tokens: 260,
+        temperature: state.config.temperature,
+        stop: ['\n\n\n']
+      },
+      undefined,
+      'background'
+    );
+
+    if (!response.choices || response.choices.length === 0) return '(No response)';
+    return response.choices[0].text.trim();
+  } catch (e) {
+    api.v1.error('General revision coach error:', e);
+    return '(Error generating coaching)';
+  }
+}
+
+function pickSingleLineContext(note: string, passage: string): string {
+  const lines = passage.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (lines.length <= 1) return passage.trim();
+
+  const quoted = note.match(/["\u201C]([^"\u201D]{12,})["\u201D]/);
+  if (quoted) {
+    const quote = quoted[1].trim();
+    const exact = lines.find(line => line.includes(quote));
+    if (exact) return exact;
+  }
+
+  const noteWords = new Set((note.toLowerCase().match(/\b[a-z]{4,}\b/g) ?? []));
+  let bestLine: string = lines[lines.length - 1] ?? passage.trim();
+  let bestScore = -1;
+  for (const line of lines) {
+    const words = line.toLowerCase().match(/\b[a-z]{4,}\b/g) ?? [];
+    const score = words.filter(word => noteWords.has(word)).length;
+    if (score > bestScore) {
+      bestScore = score;
+      bestLine = line;
+    }
+  }
+
+  return bestLine;
+}
+
+// ============================================================================
+// AUTO-ANALYSIS (fires after generation, no AI cost for SDT/Tag)
+// ============================================================================
+
+async function runAutoAnalysis(force: boolean = false, includeGeneralCoach: boolean = true): Promise<void> {
+  const scanned = await api.v1.document.scan();
+  if (scanned.length === 0) return;
+
+  const fullText = scanned.map(s => s.section.text).join('\n');
+
+  // Trim to token window — work out how many sections fit from the end
+  let sectionTexts: string[] = scanned.map(s => s.section.text);
+  let analysisText = fullText;
+  if (fullText.length > 0) {
+    try {
+      const tokens = await api.v1.tokenizer.encode(fullText, 'glm-4-6');
+      if (tokens.length > state.config.tokenWindow) {
+        const trimmed = tokens.slice(-state.config.tokenWindow);
+        analysisText = await api.v1.tokenizer.decode(trimmed, 'glm-4-6');
+        // Re-derive per-section texts from the trimmed window
+        // Keep sections from the end until we exceed the trimmed text length
+        let charCount = 0;
+        const keptSections: string[] = [];
+        for (let i = sectionTexts.length - 1; i >= 0; i--) {
+          charCount += sectionTexts[i].length + 1;
+          if (charCount > analysisText.length * 1.1) break;
+          keptSections.unshift(sectionTexts[i]);
+        }
+        sectionTexts = keptSections.length > 0 ? keptSections : [analysisText];
+      }
+    } catch (_) {
+      const charLimit = state.config.tokenWindow * 4;
+      if (fullText.length > charLimit) {
+        analysisText = fullText.slice(-charLimit);
+        sectionTexts = [analysisText];
+      }
+    }
+  }
+
+  if (!force && analysisText === state.lastAnalyzedText) {
+    // Text unchanged — still re-run the general coach for a fresh observation,
+    // but skip the zero-cost regex passes (flags won't have changed)
+    if (includeGeneralCoach && state.config.enableAutoCoaching && state.config.enableGeneralCoach) {
+      state.autoGeneral = await coachGeneral(analysisText);
+      await updatePanel();
+    }
+    return;
+  }
+  state.lastAnalyzedText = analysisText;
+  const analysisStart = findAnalysisStart(fullText, analysisText);
+  const sdtInitialInQuote = countQuoteChars(fullText.slice(0, analysisStart)) % 2 === 1;
+
+  // Clear any open inline coaching from the previous generation's flags
+  resetFlagCoachState();
+
+  // Zero-cost regex passes — isolate each detector so one runtime issue does not
+  // kill the entire refresh flow.
+  try {
+    state.autoSdtFlags = state.config.enableSdtDetection
+      ? detectSdtFlags(analysisText, sectionTexts, sdtInitialInQuote, fullText, analysisStart)
+      : [];
+  } catch (e) {
+    state.autoSdtFlags = [];
+    api.v1.error('SDT detection error:', e);
+  }
+
+  try {
+    state.autoTagFlags = state.config.enableTagDetection
+      ? detectTagFlags(analysisText, sectionTexts, sdtInitialInQuote, fullText, analysisStart)
+      : [];
+  } catch (e) {
+    state.autoTagFlags = [];
+    api.v1.error('Tag detection error:', e);
+  }
+
+  try {
+    state.autoAdverbFlags = state.config.enableAdverbDetection
+      ? detectAdverbFlags(analysisText, sectionTexts, sdtInitialInQuote, fullText, analysisStart)
+      : [];
+  } catch (e) {
+    state.autoAdverbFlags = [];
+    api.v1.error('Adverb detection error:', e);
+  }
+
+  try {
+    state.autoPassiveFlags = state.config.enablePassiveDetection
+      ? detectPassiveFlags(analysisText, sectionTexts, sdtInitialInQuote, fullText, analysisStart)
+      : [];
+  } catch (e) {
+    state.autoPassiveFlags = [];
+    api.v1.error('Passive detection error:', e);
+  }
+
+  await runAutoReplaceSdtFlags();
+
+  // Lightweight general coach (single low-token AI call)
+  if (includeGeneralCoach && state.config.enableAutoCoaching && state.config.enableGeneralCoach) {
+    state.autoGeneral = await coachGeneral(analysisText);
+  }
+
+  await updatePanel();
+}
+
+async function runAutoReplaceSdtFlags(): Promise<void> {
+  if (!state.config.enableAutoReplace || state.isAutoReplacing) return;
+
+  const sdtItems = state.config.enableSdtDetection
+    ? state.autoSdtFlags
+        .filter(flag => getConfidence(flag.score) !== 'low')
+        .map(flag => ({ kind: 'sdt' as const, flag, score: flag.score }))
+    : [];
+  const adverbItems = state.config.enableAdverbDetection
+    ? state.autoAdverbFlags
+        .filter(flag => getConfidence(flag.score) !== 'low')
+        .map(flag => ({ kind: 'adverb' as const, flag, score: flag.score }))
+    : [];
+  const itemsToReplace = [...sdtItems, ...adverbItems]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+  if (itemsToReplace.length === 0) return;
+
+  const hasPermission = await api.v1.permissions.has('documentEdit');
+  if (!hasPermission) {
+    const granted = await api.v1.permissions.request(
+      'documentEdit',
+      "Prose Coach needs permission to edit the document in order to auto-replace prose flags."
+    );
+    if (!granted) {
+      api.v1.ui.toast('Auto replace skipped - document edit permission denied', { type: 'warning' });
+      return;
+    }
+  }
+
+  state.isAutoReplacing = true;
+  await updatePanel();
+
+  let replacedCount = 0;
+  try {
+    for (const item of itemsToReplace) {
+      const quotaReady = await waitForAutoReplaceQuota(item);
+      if (!quotaReady) break;
+
+      const feedback = item.kind === 'sdt'
+        ? await coachSdt(item.flag.narration, item.flag.word, item.flag.type, item.flag.context)
+        : await coachAdverb(item.flag.narration, item.flag.word, item.flag.context);
+      const revision = extractRevisionText(feedback);
+      if (!revision) continue;
+
+      const replaced = await replaceSentenceInDocument(item.flag.narration, revision, item.flag.narration, false);
+      if (replaced) replacedCount++;
+    }
+
+    if (replacedCount > 0) {
+      state.autoSdtFlags = [];
+      state.autoAdverbFlags = [];
+      state.lastAnalyzedText = '';
+      api.v1.ui.toast(`Auto replaced ${replacedCount} prose flag${replacedCount === 1 ? '' : 's'}`, { type: 'success' });
+    }
+  } catch (e) {
+    api.v1.error('Auto replace error:', e);
+    api.v1.ui.toast('Auto replace error - check script log', { type: 'error' });
+  } finally {
+    state.isAutoReplacing = false;
+  }
+}
+
+async function waitForAutoReplaceQuota(item: { kind: 'sdt'; flag: SdtFlag } | { kind: 'adverb'; flag: AdverbFlag }): Promise<boolean> {
+  const outputTokensNeeded = 320;
+  let inputTokensNeeded = 800;
+
+  try {
+    let prompt = '';
+    if (item.kind === 'sdt') {
+      const basePrompt = item.flag.type === 'reaction_tell' ? state.config.reactionPrompt : state.config.sdtPrompt;
+      const ban = `\n\nIMPORTANT: The revision must NOT contain the word "${item.flag.word}" or any of its forms. Find a way to show the same thing without using that word at all.`;
+      prompt = `${basePrompt}${ban}\n\n${buildTargetContextBlock(item.flag.narration, item.flag.context)}`;
+    } else {
+      prompt = `You are a surgical prose coach. The target narration sentence uses the adverb "${item.flag.word}". Use the local context to understand meaning, but give one revised sentence for the target only. Explain what the adverb is trying to add, then strengthen the verb or action so the adverb is unnecessary. Preserve meaning, POV, and tone. Be direct and surgical — no preamble. Format: ISSUE: [adverb and what it is doing] | REVISION: [rewrite]\n\n${buildTargetContextBlock(item.flag.narration, item.flag.context)}`;
+    }
+    inputTokensNeeded = Math.max(
+      200,
+      await api.v1.script.countUncachedInputTokens([{ role: 'user', content: prompt }], 'glm-4-6')
+    );
+  } catch (_) {
+    inputTokensNeeded = 800;
+  }
+
+  const allowedInput = api.v1.script.getAllowedInput();
+  const allowedOutput = api.v1.script.getAllowedOutput();
+  if (allowedInput >= inputTokensNeeded && allowedOutput >= outputTokensNeeded) {
+    return true;
+  }
+
+  const inputWait = api.v1.script.getTimeUntilAllowedInput(inputTokensNeeded);
+  const outputWait = api.v1.script.getTimeUntilAllowedOutput(outputTokensNeeded);
+  const waitMs = Math.max(inputWait, outputWait);
+  const waitSeconds = Math.max(1, Math.ceil(waitMs / 1000));
+  api.v1.ui.toast(`Auto replace waiting for quota (${waitSeconds}s)`, { type: 'info' });
+
+  if (allowedInput < inputTokensNeeded) {
+    await api.v1.script.waitForAllowedInput(inputTokensNeeded);
+  }
+  if (allowedOutput < outputTokensNeeded) {
+    await api.v1.script.waitForAllowedOutput(outputTokensNeeded);
+  }
+
+  await loadConfig();
+  return state.config.enableAutoReplace;
+}
+
+// ============================================================================
+// CONTEXT MENU COACHING ACTIONS
+// ============================================================================
+
+async function runContextMenuCoach(
+  selection: DocumentSelection,
+  mode: 'sdt' | 'tag' | 'general'
+): Promise<void> {
+  if (state.isCoaching) {
+    api.v1.ui.toast('Already coaching — please wait', { type: 'warning' });
+    return;
+  }
+
+  // Extract selected text
+  const sections = await api.v1.document.scan();
+
+  // Find from/to positions by array index, not sectionId comparison —
+  // sectionIds are arbitrary integers, not guaranteed sequential
+  const fromIdx = sections.findIndex(s => s.sectionId === selection.from.sectionId);
+  const toIdx = sections.findIndex(s => s.sectionId === selection.to.sectionId);
+
+  let passage = '';
+
+  if (fromIdx === -1 || toIdx === -1) {
+    api.v1.ui.toast('Could not locate selection in document', { type: 'warning' });
+    return;
+  }
+
+  for (let i = fromIdx; i <= toIdx; i++) {
+    const { sectionId, section } = sections[i];
+    const sText = section.text;
+    if (i === fromIdx && i === toIdx) {
+      passage = sText.substring(selection.from.offset, selection.to.offset);
+    } else if (i === fromIdx) {
+      passage = sText.substring(selection.from.offset);
+    } else if (i === toIdx) {
+      passage += '\n' + sText.substring(0, selection.to.offset);
+    } else {
+      passage += '\n' + sText;
+    }
+  }
+
+  passage = passage.trim();
+
+  if (passage.length < 20) {
+    api.v1.ui.toast('Please select more text to coach (at least a sentence or two)', { type: 'warning' });
+    return;
+  }
+
+  state.isCoaching = true;
+  await updatePanel();
+
+  const modeLabel = mode === 'sdt' ? '👁 Show-Don\'t-Tell' :
+                    mode === 'tag' ? '🏷 Action Tag' : '💬 General';
+
+  api.v1.ui.toast(`${modeLabel} coaching in progress...`, { type: 'info' });
+
+  try {
+    let feedback = '';
+
+    if (mode === 'sdt') {
+      feedback = await coachSdt(passage, undefined, 'selection');
+    } else if (mode === 'tag') {
+      feedback = await coachTags(passage);
+    } else {
+      feedback = await coachGeneral(passage);
+    }
+
+    if (feedback) {
+      const entry: CoachEntry = {
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        timestamp: Date.now(),
+        mode,
+        text: passage.length > 80 ? passage.substring(0, 80) + '...' : passage,
+        passage,
+        feedback
+      };
+
+      state.feed.unshift(entry);
+      if (state.feed.length > 20) state.feed.pop();
+
+      await updatePanel();
+      api.v1.ui.toast(`${modeLabel} coaching ready — see sidebar`, { type: 'success' });
+    }
+  } catch (e) {
+    api.v1.error('Coach error:', e);
+    api.v1.ui.toast('Coaching error — check script log', { type: 'error' });
+  } finally {
+    state.isCoaching = false;
+    await updatePanel();
+  }
+}
+
+// ============================================================================
+// INLINE FLAG COACHING — lazy fetch, cached, toggled by clicking the flag card
+// ============================================================================
+
+/**
+ * Called when the user clicks a flag card in the sidebar.
+ * First click: fetches surgical coaching for that sentence, caches it, expands.
+ * Subsequent clicks: just toggle expand/collapse (no new AI call).
+ */
+async function runInlineCoaching(
+  key: string,
+  fetcher: () => Promise<string>,
+  errorLabel: string
+): Promise<void> {
+  if (state.fetchingFlagKey !== null) {
+    api.v1.ui.toast('Already fetching coaching - please wait', { type: 'warning' });
+    return;
+  }
+
+  state.fetchingFlagKey = key;
+  state.expandedFlags.add(key);
+  await updatePanel();
+
+  try {
+    const feedback = await fetcher();
+    state.flagCoachCache.set(key, feedback || '(No coaching generated)');
+  } catch (e) {
+    api.v1.error(`${errorLabel} error:`, e);
+    state.flagCoachCache.set(key, '(Error - check script log)');
+  } finally {
+    state.fetchingFlagKey = null;
+    await updatePanel();
+  }
+}
+
+async function toggleFlagCoaching(
+  key: string,
+  sentence: string,
+  mode: 'sdt' | 'tag' | 'adverb' | 'passive',
+  triggerWord?: string,
+  flagType?: string,
+  context?: string
+): Promise<void> {
+  // If already expanded, just collapse
+  if (state.expandedFlags.has(key)) {
+    state.expandedFlags.delete(key);
+    await updatePanel();
+    return;
+  }
+
+  // If result already cached, just expand
+  if (state.flagCoachCache.has(key)) {
+    state.expandedFlags.add(key);
+    await updatePanel();
+    return;
+  }
+
+  await runInlineCoaching(key, async () => {
+    if (mode === 'sdt') return coachSdt(sentence, triggerWord, flagType, context);
+    if (mode === 'adverb') return coachAdverb(sentence, triggerWord || 'adverb', context);
+    if (mode === 'passive') return coachPassive(sentence, triggerWord || 'passive phrasing', context);
+    return coachTags(sentence);
+  }, 'Inline flag coach');
+}
+
+async function toggleGeneralRevisionCoaching(key: string, generalLine: string): Promise<void> {
+  if (/^Nothing stands out\.?$/i.test(generalLine.trim())) {
+    api.v1.ui.toast('General Coach did not flag a specific sentence this time', { type: 'info' });
+    return;
+  }
+
+  if (state.expandedFlags.has(key)) {
+    state.expandedFlags.delete(key);
+    await updatePanel();
+    return;
+  }
+
+  if (state.flagCoachCache.has(key)) {
+    state.expandedFlags.add(key);
+    await updatePanel();
+    return;
+  }
+
+  await runInlineCoaching(
+    key,
+    () => coachGeneralRevision(generalLine, state.lastAnalyzedText || generalLine),
+    'Inline general revision coach'
+  );
+}
+
+
+async function toggleSdtClusterCoaching(
+  key: string,
+  passage: string,
+  words: string[],
+  flagType: string
+): Promise<void> {
+  if (state.expandedFlags.has(key)) {
+    state.expandedFlags.delete(key);
+    await updatePanel();
+    return;
+  }
+
+  if (state.flagCoachCache.has(key)) {
+    state.expandedFlags.add(key);
+    await updatePanel();
+    return;
+  }
+
+  await runInlineCoaching(
+    key,
+    () => coachSdtCluster(passage, words, flagType),
+    'Inline cluster coach'
+  );
+}
+
+async function retryInlineCoaching(key: string, fetcher: () => Promise<string>): Promise<void> {
+  await runInlineCoaching(key, fetcher, 'Inline retry coach');
+}
+
+/**
+ * Clear all inline coaching state when flags are refreshed after a new generation.
+ * Keeps the cache small and prevents stale coaching from showing on new text.
+ */
+function resetFlagCoachState(): void {
+  state.expandedFlags.clear();
+  state.flagCoachCache.clear();
+  state.fetchingFlagKey = null;
+}
+
+
+function getConfidence(score: number): string {
+  if (score >= 3) return 'high';
+  if (score >= 2) return 'medium';
+  return 'low';
+}
+
+function getConfidenceColor(confidence: string): string {
+  if (confidence === 'high') return '#cc4444';
+  if (confidence === 'medium') return '#e6aa44';
+  return '#6688aa';
+}
+
+function getDominantSdtCluster(flags: SdtFlag[]): { type: string; flags: SdtFlag[]; words: string[]; score: number; confidence: string; label: string; passage: string } | null {
+  const source = state.lastAnalyzedText || '';
+  const groups = new Map<string, SdtFlag[]>();
+  for (const flag of flags) {
+    const group = groups.get(flag.type) ?? [];
+    group.push(flag);
+    groups.set(flag.type, group);
+  }
+
+  let bestType: string | null = null;
+  let bestFlags: SdtFlag[] = [];
+  let bestScore = 0;
+
+  // Do not cluster every same-type flag across the whole analysis window.
+  // Cluster only nearby flags, or the paragraph-level rewrite prompt can swallow
+  // an entire scene. This keeps the fix local and surgical.
+  groups.forEach((group, type) => {
+    if (group.length < 2) return;
+
+    const positioned = getPositionedFlags(group)
+      .filter(item => item.index >= 0)
+      .sort((a, b) => a.index - b.index);
+
+    const candidateClusters: SdtFlag[][] = [];
+
+    if (positioned.length >= 2) {
+      let current: { flag: SdtFlag; index: number; end: number }[] = [positioned[0]];
+      for (let i = 1; i < positioned.length; i++) {
+        const prev = current[current.length - 1];
+        const next = positioned[i];
+        const gap = next.index - prev.end;
+        const crossesLineBreak = /\r|\n/.test(source.slice(prev.end, next.index));
+        if (!crossesLineBreak && gap <= 420) {
+          current.push(next);
+        } else {
+          if (current.length >= 2) candidateClusters.push(current.map(item => item.flag));
+          current = [next];
+        }
+      }
+      if (current.length >= 2) candidateClusters.push(current.map(item => item.flag));
+    }
+
+    for (const cluster of candidateClusters) {
+      const groupScore = cluster.reduce((sum, flag) => sum + flag.score, 0);
+      if (groupScore > bestScore) {
+        bestScore = groupScore;
+        bestType = type;
+        bestFlags = cluster.slice().sort((a, b) => b.score - a.score);
+      }
+    }
+  });
+
+  if (!bestType || bestFlags.length < 2) return null;
+
+  const words = Array.from(new Set(bestFlags.map(flag => flag.word)));
+  const maxScore = Math.max(...bestFlags.map(flag => flag.score));
+  const confidence = getConfidence(maxScore);
+  const label = bestType === 'filter_verb' ? 'Internal filtering cluster' :
+                bestType === 'reaction_tell' ? 'Reaction tell cluster' :
+                'Telling-word cluster';
+  const passage = buildSdtClusterPassage(bestFlags);
+
+  return { type: bestType, flags: bestFlags, words, score: maxScore, confidence, label, passage };
+}
+
+function getPositionedFlags(flags: SdtFlag[]): { flag: SdtFlag; index: number; end: number }[] {
+  const source = state.lastAnalyzedText || '';
+  return flags.map(flag => {
+    let idx = source.indexOf(flag.sentence);
+    let needle = flag.sentence;
+    if (idx === -1) {
+      idx = source.indexOf(flag.narration);
+      needle = flag.narration;
+    }
+    return { flag, index: idx, end: idx === -1 ? -1 : idx + needle.length };
+  });
+}
+
+function buildSdtClusterPassage(flags: SdtFlag[]): string {
+  const source = state.lastAnalyzedText || '';
+  const positioned = getPositionedFlags(flags)
+    .filter(item => item.index >= 0)
+    .sort((a, b) => a.index - b.index);
+
+  // Primary behavior: rewrite the flagged sentence cluster only.
+  // Add a tiny amount of sentence-boundary context, then hard-cap the size.
+  if (positioned.length > 0) {
+    let start = positioned[0].index;
+    let end = positioned[positioned.length - 1].end;
+
+    // Pull to nearby sentence boundaries, not arbitrary 260-char padding.
+    const before = source.slice(0, start);
+    const after = source.slice(end);
+    const prevLineBreak = Math.max(before.lastIndexOf('\n'), before.lastIndexOf('\r'));
+    const prevBoundary = Math.max(before.lastIndexOf('. '), before.lastIndexOf('! '), before.lastIndexOf('? '), prevLineBreak);
+    const nextCandidates = [
+      after.indexOf('. '),
+      after.indexOf('! '),
+      after.indexOf('? '),
+      ...[after.indexOf('\n'), after.indexOf('\r')]
+    ].filter(idx => idx >= 0);
+    const nextBoundary = nextCandidates.length > 0 ? Math.min(...nextCandidates) : -1;
+
+    if (prevLineBreak !== -1 && prevLineBreak > prevBoundary - 2) {
+      start = prevLineBreak + 1;
+    } else if (prevBoundary !== -1 && start - prevBoundary <= 180) {
+      start = prevBoundary + 1;
+    }
+    const nextLineBreakCandidates = [after.indexOf('\n'), after.indexOf('\r')].filter(index => index >= 0);
+    const nextLineBreak = nextLineBreakCandidates.length > 0 ? Math.min(...nextLineBreakCandidates) : -1;
+    if (nextLineBreak !== -1 && (nextBoundary === -1 || nextLineBreak <= nextBoundary)) {
+      end = end + nextLineBreak;
+    } else if (nextBoundary !== -1 && nextBoundary <= 180) {
+      end = end + nextBoundary + 1;
+    }
+
+    let passage = source.slice(start, end).trim();
+
+    // Hard stop: cluster coaching should never feed a whole scene.
+    // If still too large, use just the flagged sentences.
+    if (passage.length > 950) {
+      passage = positioned.map(item => item.flag.sentence).join(' ').trim();
+    }
+
+    if (passage.length > 950) {
+      passage = passage.slice(0, 950).replace(/\s+\S*$/, '').trim();
+    }
+
+    return passage;
+  }
+
+  return flags[0]?.sentence ?? '';
+}
+
+// ============================================================================
+// UI — PANEL CONTENT
+// ============================================================================
+
+/**
+ * Diff originalText against revisionText at word level using LCS.
+ * Returns an array of spans: { text, isNew } where isNew=true means the words
+ * are novel (should be tagged 'ai') and isNew=false means they match the original
+ * (should carry no origin tag, i.e. treated as user-generated).
+ */
+function diffRevisionSpans(originalText: string, revisionText: string): { text: string; isNew: boolean }[] {
+  // Tokenize into words+whitespace so we can reconstruct the string exactly.
+  // Each token is either a word (letters/digits/punctuation run) or whitespace.
+  const tokenize = (s: string): string[] => s.match(/\S+|\s+/g) ?? [];
+  const origTokens = tokenize(originalText);
+  const revTokens = tokenize(revisionText);
+
+  // LCS on lowercased word tokens (ignore whitespace tokens for matching)
+  const origWords = origTokens.filter(t => /\S/.test(t)).map(t => t.toLowerCase());
+  const revWords  = revTokens.filter(t => /\S/.test(t)).map(t => t.toLowerCase());
+  const m = origWords.length, n = revWords.length;
+
+  // Build LCS table
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = origWords[i - 1] === revWords[j - 1]
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+
+  // Backtrack to find which revision word indices are matched
+  const matchedRevIdx = new Set<number>();
+  let i = m, j = n;
+  while (i > 0 && j > 0) {
+    if (origWords[i - 1] === revWords[j - 1]) {
+      matchedRevIdx.add(j - 1); i--; j--;
+    } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+      i--;
+    } else {
+      j--;
+    }
+  }
+
+  // Walk revTokens and emit spans, grouping consecutive same-isNew tokens
+  const spans: { text: string; isNew: boolean }[] = [];
+  let revWordIdx = 0;
+  for (const token of revTokens) {
+    const isWord = /\S/.test(token);
+    const isNew = isWord ? !matchedRevIdx.has(revWordIdx) : false; // whitespace inherits next word's status below
+    if (isWord) revWordIdx++;
+
+    if (spans.length > 0 && spans[spans.length - 1].isNew === isNew) {
+      spans[spans.length - 1].text += token;
+    } else {
+      spans.push({ text: token, isNew });
+    }
+  }
+
+  // Merge leading/trailing whitespace into adjacent spans so we don't emit
+  // tiny whitespace-only spans with wrong isNew flags
+  return spans.filter(s => s.text.length > 0);
+}
+
+function isRangeFullyAiOrigin(
+  origin: { position: number; length: number; data: string }[],
+  text: string,
+  start: number,
+  length: number
+): boolean {
+  if (length <= 0) return false;
+
+  const end = start + length;
+  let checkedAnyNonWhitespace = false;
+
+  for (let pos = start; pos < end && pos < text.length; pos++) {
+    if (/\s/.test(text[pos])) continue;
+    checkedAnyNonWhitespace = true;
+
+    const coveredByAi = origin.some(seg =>
+      seg.data === 'ai' &&
+      pos >= seg.position &&
+      pos < seg.position + seg.length
+    );
+
+    if (!coveredByAi) return false;
+  }
+
+  return checkedAnyNonWhitespace;
+}
+
+function extractRevisionText(feedback: string): string | null {
+  const match = feedback.match(/REVISION:\s*(.+)/i);
+  return match ? match[1].trim() : null;
+}
+
+const stripBBCode = (text: string): string => text.replace(/\[[^\]]*\]/g, '');
+const normalizeQuotes = (text: string): string => text.replace(/[\u201C\u201D\u2018\u2019]/g, '"');
+
+async function replaceSentenceInDocument(
+  targetSentence: string,
+  revisionText: string,
+  originalPassage?: string,
+  showToast: boolean = true
+): Promise<boolean> {
+  const needle = targetSentence.trim();
+  const needlePlain = stripBBCode(needle);
+  const needlePlainNorm = normalizeQuotes(needlePlain);
+
+  let targetSectionId: number | null = null;
+  let updatedText: string | null = null;
+  let replacedLength = needle.length;
+
+  const sections = await api.v1.document.scan();
+  const passagePlainNorm = originalPassage
+    ? normalizeQuotes(stripBBCode(originalPassage.trim()))
+    : null;
+  const candidateSections = passagePlainNorm
+    ? sections.filter(({ section }) => normalizeQuotes(stripBBCode(section.text)).includes(passagePlainNorm))
+    : sections;
+  const searchSections = candidateSections.length > 0 ? candidateSections : sections;
+
+  for (const { sectionId, section } of searchSections) {
+    const sText = section.text;
+    if (sText.includes(needle)) {
+      targetSectionId = sectionId;
+      updatedText = sText.replace(needle, revisionText);
+      break;
+    }
+
+    const sPlain = stripBBCode(sText);
+    const sPlainNorm = normalizeQuotes(sPlain);
+    const plainIdx = sPlainNorm.indexOf(needlePlainNorm);
+    if (plainIdx !== -1) {
+      targetSectionId = sectionId;
+
+      let plainPos = 0;
+      let taggedStart = 0;
+      let inTag = false;
+      for (let ci = 0; ci < sText.length; ci++) {
+        if (sText[ci] === '[') inTag = true;
+        if (!inTag) {
+          if (plainPos === plainIdx) { taggedStart = ci; break; }
+          plainPos++;
+        }
+        if (sText[ci] === ']') inTag = false;
+      }
+
+      let plainConsumed = 0;
+      let taggedEnd = taggedStart;
+      inTag = false;
+      for (let ci = taggedStart; ci < sText.length && plainConsumed < needlePlain.length; ci++) {
+        if (sText[ci] === '[') inTag = true;
+        if (!inTag) plainConsumed++;
+        if (sText[ci] === ']') inTag = false;
+        taggedEnd = ci + 1;
+      }
+
+      updatedText = sText.slice(0, taggedStart) + revisionText + sText.slice(taggedEnd);
+      replacedLength = taggedEnd - taggedStart;
+      break;
+    }
+  }
+
+  if (targetSectionId === null || updatedText === null) {
+    if (showToast) {
+      api.v1.ui.toast('Original sentence not found in document — use Copy to apply manually', { type: 'warning' });
+      await api.v1.ui.modal.open({
+        title: 'Sentence Not Found',
+        size: 'small',
+        content: [
+          {
+            type: 'text',
+            text: 'The original sentence could not be located verbatim in the document (it may have been edited or is narration-stripped). Copy the revision below and paste it manually:',
+            style: { fontSize: '0.85em', opacity: 0.7, marginBottom: '8px' }
+          },
+          {
+            type: 'multilineTextInput',
+            initialValue: revisionText,
+            style: { width: '100%', fontStyle: 'italic' }
+          }
+        ]
+      });
+    }
+    return false;
+  }
+
+  try {
+    const replacementStart = (updatedText as string).indexOf(revisionText);
+    const replacementEnd = replacementStart + revisionText.length;
+    const lengthDelta = revisionText.length - replacedLength;
+
+    const freshSections = await api.v1.document.scan();
+    const freshSection = freshSections.find(s => s.sectionId === targetSectionId);
+    const existingOrigin = freshSection?.section.origin ?? [];
+    const newOrigin: { position: number; length: number; data: string }[] = [];
+
+    for (const seg of existingOrigin) {
+      const segEnd = seg.position + seg.length;
+      if (segEnd <= replacementStart) {
+        newOrigin.push({ ...seg });
+      } else if (seg.position >= replacementStart + replacedLength) {
+        newOrigin.push({ ...seg, position: seg.position + lengthDelta });
+      } else {
+        if (seg.position < replacementStart) {
+          newOrigin.push({ position: seg.position, length: replacementStart - seg.position, data: seg.data });
+        }
+        const afterStart = replacementStart + replacedLength;
+        if (segEnd > afterStart) {
+          newOrigin.push({ position: replacementEnd, length: segEnd - afterStart, data: seg.data });
+        }
+      }
+    }
+
+    const originalSentenceText = stripBBCode(needle);
+    const originalSectionText = freshSection?.section.text ?? '';
+    const replacedRangeWasAi = isRangeFullyAiOrigin(existingOrigin, originalSectionText, replacementStart, replacedLength);
+    const revSpans = diffRevisionSpans(originalSentenceText, revisionText);
+    let spanOffset = replacementStart;
+    for (const span of revSpans) {
+      if (replacedRangeWasAi || span.isNew) {
+        newOrigin.push({ position: spanOffset, length: span.text.length, data: 'ai' });
+      }
+      spanOffset += span.text.length;
+    }
+
+    newOrigin.sort((a, b) => a.position - b.position);
+    await api.v1.document.updateParagraph(targetSectionId as number, { text: updatedText as string, origin: newOrigin });
+    if (showToast) api.v1.ui.toast('Sentence replaced', { type: 'success' });
+    return true;
+  } catch (e) {
+    api.v1.error('Replace in doc error:', e);
+    if (showToast) api.v1.ui.toast('Could not update document - check script log', { type: 'error' });
+    return false;
+  }
+}
+
+/**
+ * Render coaching result lines, adding a 📋 Copy button and ✏️ Replace button after any REVISION: line.
+ * originalSentence: the narration/sentence text that was flagged — used to locate it in the document for replacement.
+ */
+function buildCoachingResultItems(
+  cachedResult: string,
+  originalSentence?: string,
+  retryCallback?: () => Promise<void>
+): any[] {
+  const items: any[] = [];
+  const lines = cachedResult.split('\n').filter((l: string) => l.trim());
+
+  // Helper to extract and clean a sentence from a SENTENCE:/TARGET: line.
+  // The model formats output as one pipe-separated line: "SENTENCE: [text] | ISSUE: ... | REVISION: ..."
+  // so we truncate at the first ' |' separator, then conditionally strip wrapping quotes.
+  const extractSentence = (raw: string): string => {
+    const pipeIdx = raw.indexOf(' |');
+    const extracted = (pipeIdx !== -1 ? raw.slice(0, pipeIdx) : raw).trim();
+    // Only strip surrounding quotes if they form a matched wrapper pair with no internal close quote.
+    const OPEN_QUOTES = new Set(['"', '\u201C']);
+    const CLOSE_QUOTES = new Set(['"', '\u201D']);
+    const first = extracted[0];
+    const last = extracted[extracted.length - 1];
+    const isWrapped = first && last &&
+                      OPEN_QUOTES.has(first) && CLOSE_QUOTES.has(last) &&
+                      extracted.slice(1, -1).indexOf(last) === -1;
+    return isWrapped ? extracted.slice(1, -1).trim() : extracted;
+  };
+
+  // Seed with originalSentence if it looks like a single sentence — used as fallback
+  // when the output has a REVISION: with no preceding SENTENCE: on the same result.
+  const seedTarget = originalSentence?.trim();
+
+  // currentTargetSentence tracks the most recently seen SENTENCE:/TARGET: as we walk lines,
+  // so each REVISION: button closes over the sentence that immediately precedes it.
+  let currentTargetSentence: string | undefined = seedTarget;
+
+  let hasRevision = false;
+  lines.forEach((line: string) => {
+    // Update the running sentence target whenever we hit a SENTENCE:/TARGET: line
+    const targetMatch = line.match(/(?:TARGET|SENTENCE):\s*(.+)/i);
+    if (targetMatch) {
+      currentTargetSentence = extractSentence(targetMatch[1]);
+    }
+    items.push({
+      type: 'text',
+      text: line,
+      style: { fontSize: '0.82em', marginTop: '4px', paddingLeft: '4px' }
+    });
+    const revisionMatch = line.match(/REVISION:\s*(.+)/i);
+    if (revisionMatch) {
+      hasRevision = true;
+      const revisionText = revisionMatch[1].trim();
+      // Capture the sentence target at the moment this REVISION: is encountered
+      const targetForThisRevision = currentTargetSentence || originalSentence;
+      items.push({
+        type: 'row',
+        spacing: 'start',
+        content: [
+          {
+            type: 'button',
+            text: '📋 Copy revision',
+            style: { fontSize: '0.78em', marginTop: '2px', marginLeft: '4px', opacity: 0.8 },
+            callback: async () => {
+              await api.v1.ui.modal.open({
+                title: 'Copy Revision',
+                size: 'small',
+                content: [
+                  {
+                    type: 'text',
+                    text: 'Select and copy the revision text below:',
+                    style: { fontSize: '0.85em', opacity: 0.7, marginBottom: '8px' }
+                  },
+                  {
+                    type: 'multilineTextInput',
+                    initialValue: revisionText,
+                    style: { width: '100%', fontStyle: 'italic' }
+                  }
+                ]
+              });
+            }
+          },
+          ...(retryCallback ? [{
+            type: 'button',
+            text: '🔁 Retry prompt',
+            style: { fontSize: '0.78em', marginTop: '2px', marginLeft: '4px', opacity: 0.8 },
+            callback: async () => {
+              await retryCallback();
+            }
+          }] : []),
+          ...(targetForThisRevision ? [{
+            type: 'button',
+            text: '✏️ Replace in doc',
+            style: { fontSize: '0.78em', marginTop: '2px', marginLeft: '4px', opacity: 0.8 },
+            callback: async () => {
+              await replaceSentenceInDocument(
+                targetForThisRevision,
+                revisionText,
+                originalSentence
+              );
+            }
+          }] : [])
+        ]
+      });
+    }
+  });
+
+  if (retryCallback && !hasRevision) {
+    items.push({
+      type: 'row',
+      spacing: 'start',
+      content: [
+        {
+          type: 'button',
+          text: '🔁 Retry prompt',
+          style: { fontSize: '0.78em', marginTop: '4px', marginLeft: '4px', opacity: 0.8 },
+          callback: async () => {
+            await retryCallback();
+          }
+        }
+      ]
+    });
+  }
+
+  return items;
+}
+
+function buildPanelContent(): any[] {
+  const content: any[] = [];
+
+  // Header
+  content.push({
+    type: 'row',
+    spacing: 'start',
+    content: [
+      {
+        type: 'text',
+        text: '**Prose Coach** — Click any flag below for inline coaching. Right-click selected text to coach any passage.',
+        markdown: true,
+        style: { marginBottom: '0' }
+      },
+      {
+        type: 'row',
+        spacing: 'start',
+        content: [
+          {
+            type: 'button',
+            text: state.config.enableAutoScan ? 'Auto Scan: On' : 'Auto Scan: Off',
+            style: { fontSize: '0.85em', flexShrink: '0' },
+            callback: async () => { await toggleAutoScan(); }
+          },
+          {
+            type: 'button',
+            text: state.isRefreshing ? 'Refreshing...' : 'Refresh',
+            style: { fontSize: '0.85em', flexShrink: '0' },
+            callback: async () => {
+              await triggerManualRefresh();
+            }
+          }
+        ]
+      }
+    ].slice(0, 1)
+  });
+
+  content.push({
+    type: 'row',
+    spacing: 'start',
+    style: { flexWrap: 'wrap', gap: '4px' },
+    content: [
+      {
+        type: 'button',
+        text: state.config.enableAutoScan ? 'Auto Scan: On' : 'Auto Scan: Off',
+        style: { fontSize: '0.85em', flexShrink: '0' },
+        callback: async () => { await toggleAutoScan(); }
+      },
+      {
+        type: 'button',
+        text: state.config.enableAutoCoaching ? 'Auto Coaching: On' : 'Auto Coaching: Off',
+        style: { fontSize: '0.85em', flexShrink: '0' },
+        callback: async () => { await toggleAutoCoaching(); }
+      },
+      {
+        type: 'button',
+        text: state.config.enableAutoReplace ? 'Auto Replace: On' : 'Auto Replace: Off',
+        style: { fontSize: '0.85em', flexShrink: '0' },
+        callback: async () => { await toggleAutoReplace(); }
+      },
+      {
+        type: 'button',
+        text: state.isRefreshing ? 'Refreshing...' : 'Refresh',
+        style: { fontSize: '0.85em', flexShrink: '0' },
+        callback: async () => {
+          await triggerManualRefresh();
+        }
+      }
+    ]
+  });
+
+  if (state.isCoaching) {
+    content.push({
+      type: 'box',
+      style: {
+        backgroundColor: '#1a2a3a',
+        padding: '8px',
+        borderRadius: '4px',
+        borderLeft: '3px solid #88aaff',
+        marginBottom: '10px'
+      },
+      content: [{
+        type: 'text',
+        text: '⏳ Coaching in progress...',
+        style: { fontSize: '0.9em' }
+      }]
+    });
+  }
+
+  if (state.isAutoReplacing) {
+    content.push({
+      type: 'box',
+      style: {
+        backgroundColor: '#2a2418',
+        padding: '8px',
+        borderRadius: '4px',
+        borderLeft: '3px solid #e6aa44',
+        marginBottom: '10px'
+      },
+      content: [{
+        type: 'text',
+        text: 'Auto replace in progress...',
+        style: { fontSize: '0.9em' }
+      }]
+    });
+  }
+
+  // Auto-detection section (zero cost)
+  const hasAutoFlags = state.autoSdtFlags.length > 0 || state.autoTagFlags.length > 0 || state.autoAdverbFlags.length > 0 || state.autoPassiveFlags.length > 0 || state.autoGeneral;
+
+  if (hasAutoFlags) {
+    const autoContent: any[] = [];
+
+    // General one-liner
+    if (state.config.enableAutoCoaching && state.autoGeneral) {
+      // Split the three-sentence response: craft note | line to strengthen | story musing
+      const generalLines = state.autoGeneral.split('\n').map((l: string) => l.trim()).filter(Boolean);
+      const icons = ['💬', '🔍', '🌀'];
+      const generalContent: any[] = [];
+      generalLines.forEach((line: string, idx: number) => {
+        if (idx > 0) {
+          generalContent.push({ type: 'separator' });
+        }
+        if (idx === 1) {
+          const key = 'general-strengthen';
+          const isExpanded = state.expandedFlags.has(key);
+          const isFetching = state.fetchingFlagKey === key;
+          const cachedResult = state.flagCoachCache.get(key);
+          const chevron = isExpanded ? 'v' : '>';
+          const cardContent: any[] = [
+            {
+              type: 'button',
+              text: `${chevron} ${icons[idx]} Line to strengthen`,
+              style: {
+                fontSize: '0.85em',
+                textAlign: 'left',
+                width: '100%',
+                background: 'none',
+                border: 'none',
+                padding: '0',
+                cursor: 'pointer',
+                fontWeight: 'bold',
+                opacity: isFetching ? 0.5 : 1
+              },
+              callback: async () => { await toggleGeneralRevisionCoaching(key, line); }
+            },
+            {
+              type: 'button',
+              text: line,
+              style: {
+                fontSize: '0.8em',
+                opacity: 0.75,
+                marginTop: '2px',
+                textAlign: 'left',
+                width: '100%',
+                background: 'none',
+                border: 'none',
+                padding: '0',
+                cursor: 'pointer'
+              },
+              callback: async () => { await toggleGeneralRevisionCoaching(key, line); }
+            }
+          ];
+
+          if (isExpanded) {
+            if (isFetching) {
+              cardContent.push({
+                type: 'text',
+                text: 'Loading revision...',
+                style: { fontSize: '0.82em', opacity: 0.7, marginTop: '6px', paddingLeft: '4px' }
+              });
+            } else if (cachedResult) {
+              for (const item of buildCoachingResultItems(
+                cachedResult,
+                undefined,
+                async () => { await retryInlineCoaching(key, async () => await coachGeneralRevision(line, state.lastAnalyzedText || line)); }
+              )) {
+                cardContent.push(item);
+              }
+            }
+          }
+
+          generalContent.push({
+            type: 'box',
+            style: {
+              backgroundColor: 'bg1',
+              padding: '6px 8px',
+              borderRadius: '4px',
+              marginTop: '4px',
+              marginBottom: '4px',
+              borderLeft: isExpanded ? '3px solid #aa88ff' : '3px solid #8866dd'
+            },
+            content: cardContent
+          });
+          return;
+        }
+        generalContent.push({
+          type: 'text',
+          text: `${icons[idx] ?? '•'} ${line}`,
+          style: {
+            fontSize: '0.88em',
+            fontStyle: idx === 2 ? 'italic' : 'normal',
+            opacity: idx === 2 ? 0.75 : 1,
+            marginTop: '4px',
+            marginBottom: '4px'
+          }
+        });
+      });
+      autoContent.push({
+        type: 'box',
+        style: {
+          backgroundColor: 'bg1',
+          padding: '8px',
+          borderRadius: '4px',
+          marginBottom: '6px',
+          borderLeft: '3px solid #aa88ff'
+        },
+        content: generalContent
+      });
+    }
+
+    // SDT flags
+    if (state.autoSdtFlags.length > 0) {
+      const flagLabel = state.autoSdtFlags.length === 1 ? '1 telling moment' : `${state.autoSdtFlags.length} telling moments`;
+      autoContent.push({
+        type: 'text',
+        text: `**👁 Show-Don't-Tell** — ${flagLabel} detected:`,
+        markdown: true,
+        style: { fontSize: '0.9em', marginTop: '4px', marginBottom: '4px' }
+      });
+
+      const sdtCluster = getDominantSdtCluster(state.autoSdtFlags);
+      if (sdtCluster) {
+        const key = 'sdt-cluster';
+        const isExpanded = state.expandedFlags.has(key);
+        const isFetching = state.fetchingFlagKey === key;
+        const cachedResult = state.flagCoachCache.get(key);
+        const chevron = isExpanded ? 'v' : '>';
+        const color = getConfidenceColor(sdtCluster.confidence);
+        const wordList = sdtCluster.words.join(', ');
+        const preview = sdtCluster.passage.length > 130 ? sdtCluster.passage.substring(0, 130) + '...' : sdtCluster.passage;
+        const cardContent: any[] = [
+          {
+            type: 'button',
+            text: `${chevron} 🔧 ${sdtCluster.label} (${sdtCluster.confidence})`,
+            style: {
+              fontSize: '0.85em',
+              textAlign: 'left',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              padding: '0',
+              cursor: 'pointer',
+              fontWeight: 'bold',
+              opacity: isFetching ? 0.5 : 1
+            },
+            callback: async () => { await toggleSdtClusterCoaching(key, sdtCluster.passage, sdtCluster.words, sdtCluster.type); }
+          },
+          {
+            type: 'button',
+            text: `Pattern words: ${wordList}`,
+            style: {
+              fontSize: '0.8em',
+              opacity: 0.8,
+              marginTop: '2px',
+              textAlign: 'left',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              padding: '0',
+              cursor: 'pointer'
+            },
+            callback: async () => { await toggleSdtClusterCoaching(key, sdtCluster.passage, sdtCluster.words, sdtCluster.type); }
+          },
+          {
+            type: 'button',
+            text: preview,
+            style: {
+              fontSize: '0.8em',
+              opacity: 0.65,
+              marginTop: '2px',
+              fontStyle: 'italic',
+              textAlign: 'left',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              padding: '0',
+              cursor: 'pointer'
+            },
+            callback: async () => { await toggleSdtClusterCoaching(key, sdtCluster.passage, sdtCluster.words, sdtCluster.type); }
+          }
+        ];
+
+        if (isExpanded) {
+          if (isFetching) {
+            cardContent.push({
+              type: 'text',
+              text: '⏳ Fetching cluster coaching...',
+              style: { fontSize: '0.82em', opacity: 0.7, marginTop: '6px', paddingLeft: '4px' }
+            });
+          } else if (cachedResult) {
+            for (const item of buildCoachingResultItems(
+              cachedResult,
+              undefined,
+              async () => { await retryInlineCoaching(key, async () => await coachSdtCluster(sdtCluster.passage, sdtCluster.words, sdtCluster.type)); }
+            )) {
+              cardContent.push(item);
+            }
+          }
+        }
+
+        autoContent.push({
+          type: 'box',
+          style: {
+            backgroundColor: 'bg1',
+            padding: '6px 8px',
+            borderRadius: '4px',
+            marginBottom: '6px',
+            borderLeft: `3px solid ${color}`,
+            cursor: 'pointer'
+          },
+          content: cardContent
+        });
+      }
+
+      const sdtRemainingFlags = sdtCluster
+        ? state.autoSdtFlags.filter(flag => flag.type !== sdtCluster.type)
+        : state.autoSdtFlags;
+      const visibleSdtFlags = sdtRemainingFlags.filter(flag => getConfidence(flag.score) !== 'low');
+      const displayedSdtFlags = (visibleSdtFlags.length > 0 ? visibleSdtFlags : sdtRemainingFlags).slice(0, 3);
+
+      displayedSdtFlags.forEach((flag, i) => {
+        const key = `sdt-${i}`;
+        const icon = flag.type === 'filter_verb' ? '🔭' : flag.type === 'reaction_tell' ? '⚡' : '📢';
+        const label = flag.type === 'filter_verb' ? 'filter verb' : flag.type === 'reaction_tell' ? 'reaction tell' : 'telling word';
+        const confidence = getConfidence(flag.score);
+        const color = getConfidenceColor(confidence);
+        const truncated = flag.sentence.length > 100 ? flag.sentence.substring(0, 100) + '...' : flag.sentence;
+        const isExpanded = state.expandedFlags.has(key);
+        const isFetching = state.fetchingFlagKey === key;
+        const cachedResult = state.flagCoachCache.get(key);
+        const chevron = isExpanded ? 'v' : '>';
+
+        const cardContent: any[] = [
+          // Entire header row is a button spanning full width
+          {
+            type: 'button',
+            text: `${chevron} ${icon} ${flag.word} (${label}, ${confidence})`,
+            style: {
+              fontSize: '0.85em',
+              textAlign: 'left',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              padding: '0',
+              cursor: 'pointer',
+              fontWeight: 'bold',
+              opacity: isFetching ? 0.5 : 1
+            },
+            callback: async () => { await toggleFlagCoaching(key, flag.narration, 'sdt', flag.word, flag.type, flag.context); }
+          },
+          // Sentence — also a button so clicking it triggers coaching too
+          {
+            type: 'button',
+            text: truncated,
+            style: {
+              fontSize: '0.8em',
+              opacity: 0.75,
+              marginTop: '2px',
+              fontStyle: 'italic',
+              textAlign: 'left',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              padding: '0',
+              cursor: 'pointer'
+            },
+            callback: async () => { await toggleFlagCoaching(key, flag.narration, 'sdt', flag.word, flag.type, flag.context); }
+          }
+        ];
+
+        if (isExpanded) {
+          if (isFetching) {
+            cardContent.push({
+              type: 'text',
+              text: '⏳ Fetching coaching...',
+              style: { fontSize: '0.82em', opacity: 0.7, marginTop: '6px', paddingLeft: '4px' }
+            });
+          } else if (cachedResult) {
+            for (const item of buildCoachingResultItems(
+              cachedResult,
+              flag.narration,
+              async () => { await retryInlineCoaching(key, async () => await coachSdt(flag.narration, flag.word, flag.type, flag.context)); }
+            )) {
+              cardContent.push(item);
+            }
+          }
+        }
+
+        autoContent.push({
+          type: 'box',
+          style: {
+            backgroundColor: 'bg1',
+            padding: '6px 8px',
+            borderRadius: '4px',
+            marginBottom: '4px',
+            borderLeft: `3px solid ${color}`,
+            cursor: 'pointer'
+          },
+          content: cardContent
+        });
+      });
+    }
+
+    // Adverb flags
+    if (state.autoAdverbFlags.length > 0) {
+      const flagLabel = state.autoAdverbFlags.length === 1 ? '1 adverb' : `${state.autoAdverbFlags.length} adverbs`;
+      autoContent.push({
+        type: 'text',
+        text: `**Adverbs** - ${flagLabel} flagged:`,
+        markdown: true,
+        style: { fontSize: '0.9em', marginTop: '8px', marginBottom: '4px' }
+      });
+
+      state.autoAdverbFlags.slice(0, 3).forEach((flag, i) => {
+        const key = `adverb-${i}`;
+        const confidence = getConfidence(flag.score);
+        const color = getConfidenceColor(confidence);
+        const truncated = flag.sentence.length > 100 ? flag.sentence.substring(0, 100) + '...' : flag.sentence;
+        const isExpanded = state.expandedFlags.has(key);
+        const isFetching = state.fetchingFlagKey === key;
+        const cachedResult = state.flagCoachCache.get(key);
+        const chevron = isExpanded ? 'v' : '>';
+
+        const cardContent: any[] = [
+          {
+            type: 'button',
+            text: `${chevron} ${flag.word} (adverb, ${confidence})`,
+            style: {
+              fontSize: '0.85em',
+              textAlign: 'left',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              padding: '0',
+              cursor: 'pointer',
+              fontWeight: 'bold',
+              opacity: isFetching ? 0.5 : 1
+            },
+            callback: async () => { await toggleFlagCoaching(key, flag.narration, 'adverb', flag.word, undefined, flag.context); }
+          },
+          {
+            type: 'button',
+            text: truncated,
+            style: {
+              fontSize: '0.8em',
+              opacity: 0.75,
+              marginTop: '2px',
+              fontStyle: 'italic',
+              textAlign: 'left',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              padding: '0',
+              cursor: 'pointer'
+            },
+            callback: async () => { await toggleFlagCoaching(key, flag.narration, 'adverb', flag.word, undefined, flag.context); }
+          }
+        ];
+
+        if (isExpanded) {
+          if (isFetching) {
+            cardContent.push({
+              type: 'text',
+              text: 'Fetching adverb coaching...',
+              style: { fontSize: '0.82em', opacity: 0.7, marginTop: '6px', paddingLeft: '4px' }
+            });
+          } else if (cachedResult) {
+            for (const item of buildCoachingResultItems(
+              cachedResult,
+              flag.narration,
+              async () => { await retryInlineCoaching(key, async () => await coachAdverb(flag.narration, flag.word, flag.context)); }
+            )) {
+              cardContent.push(item);
+            }
+          }
+        }
+
+        autoContent.push({
+          type: 'box',
+          style: {
+            backgroundColor: 'bg1',
+            padding: '6px 8px',
+            borderRadius: '4px',
+            marginBottom: '4px',
+            borderLeft: `3px solid ${color}`,
+            cursor: 'pointer'
+          },
+          content: cardContent
+        });
+      });
+    }
+
+    // Passive voice flags - conservative, manual-only review
+    if (state.autoPassiveFlags.length > 0) {
+      const visiblePassiveFlags = state.autoPassiveFlags.filter(flag => getConfidence(flag.score) !== 'low');
+      const displayedPassiveFlags = (visiblePassiveFlags.length > 0 ? visiblePassiveFlags : state.autoPassiveFlags).slice(0, 2);
+      const flagLabel = state.autoPassiveFlags.length === 1 ? '1 passive phrase' : `${state.autoPassiveFlags.length} passive phrases`;
+      autoContent.push({
+        type: 'text',
+        text: `**Passive phrasing** - ${flagLabel} noticed:`,
+        markdown: true,
+        style: { fontSize: '0.9em', marginTop: '8px', marginBottom: '4px', opacity: visiblePassiveFlags.length > 0 ? 1 : 0.75 }
+      });
+
+      displayedPassiveFlags.forEach((flag, i) => {
+        const key = `passive-${i}`;
+        const confidence = getConfidence(flag.score);
+        const color = getConfidenceColor(confidence);
+        const truncated = flag.sentence.length > 100 ? flag.sentence.substring(0, 100) + '...' : flag.sentence;
+        const isExpanded = state.expandedFlags.has(key);
+        const isFetching = state.fetchingFlagKey === key;
+        const cachedResult = state.flagCoachCache.get(key);
+        const chevron = isExpanded ? 'v' : '>';
+
+        const cardContent: any[] = [
+          {
+            type: 'button',
+            text: `${chevron} ${flag.phrase} (passive, ${confidence})`,
+            style: {
+              fontSize: '0.85em',
+              textAlign: 'left',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              padding: '0',
+              cursor: 'pointer',
+              fontWeight: 'bold',
+              opacity: isFetching ? 0.5 : 1
+            },
+            callback: async () => { await toggleFlagCoaching(key, flag.narration, 'passive', flag.phrase, undefined, flag.context); }
+          },
+          {
+            type: 'button',
+            text: truncated,
+            style: {
+              fontSize: '0.8em',
+              opacity: 0.75,
+              marginTop: '2px',
+              fontStyle: 'italic',
+              textAlign: 'left',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              padding: '0',
+              cursor: 'pointer'
+            },
+            callback: async () => { await toggleFlagCoaching(key, flag.narration, 'passive', flag.phrase, undefined, flag.context); }
+          }
+        ];
+
+        if (isExpanded) {
+          if (isFetching) {
+            cardContent.push({
+              type: 'text',
+              text: 'Fetching passive voice coaching...',
+              style: { fontSize: '0.82em', opacity: 0.7, marginTop: '6px', paddingLeft: '4px' }
+            });
+          } else if (cachedResult) {
+            for (const item of buildCoachingResultItems(
+              cachedResult,
+              flag.narration,
+              async () => { await retryInlineCoaching(key, async () => await coachPassive(flag.narration, flag.phrase, flag.context)); }
+            )) {
+              cardContent.push(item);
+            }
+          }
+        }
+
+        autoContent.push({
+          type: 'box',
+          style: {
+            backgroundColor: 'bg1',
+            padding: '6px 8px',
+            borderRadius: '4px',
+            marginBottom: '4px',
+            borderLeft: `3px solid ${color}`,
+            cursor: 'pointer',
+            opacity: confidence === 'low' ? 0.78 : 1
+          },
+          content: cardContent
+        });
+      });
+    }
+
+    // Tag flags
+    if (state.autoTagFlags.length > 0) {
+      const flagLabel = state.autoTagFlags.length === 1 ? '1 tag' : `${state.autoTagFlags.length} tags`;
+      autoContent.push({
+        type: 'text',
+        text: `**🏷 Action Tags** — ${flagLabel} flagged:`,
+        markdown: true,
+        style: { fontSize: '0.9em', marginTop: '8px', marginBottom: '4px' }
+      });
+
+      const visibleTagFlags = state.autoTagFlags.filter(flag => getConfidence(flag.score) !== 'low');
+      const displayedTagFlags = (visibleTagFlags.length > 0 ? visibleTagFlags : state.autoTagFlags).slice(0, 3);
+
+      displayedTagFlags.forEach((flag, i) => {
+        const key = `tag-${i}`;
+        const icon = flag.type === 'adverb_tag' ? '📝' : '🏷';
+        const label = flag.type === 'adverb_tag' ? 'tag + adverb' : 'explanatory tag';
+        const confidence = getConfidence(flag.score);
+        const color = getConfidenceColor(confidence);
+        const truncated = flag.sentence.length > 100 ? flag.sentence.substring(0, 100) + '...' : flag.sentence;
+        const isExpanded = state.expandedFlags.has(key);
+        const isFetching = state.fetchingFlagKey === key;
+        const cachedResult = state.flagCoachCache.get(key);
+        const chevron = isExpanded ? 'v' : '>';
+
+        const cardContent: any[] = [
+          {
+            type: 'button',
+            text: `${chevron} ${icon} ${flag.word} (${label}, ${confidence})`,
+            style: {
+              fontSize: '0.85em',
+              textAlign: 'left',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              padding: '0',
+              cursor: 'pointer',
+              fontWeight: 'bold',
+              opacity: isFetching ? 0.5 : 1
+            },
+            callback: async () => { await toggleFlagCoaching(key, flag.sentence, 'tag'); }
+          },
+          {
+            type: 'button',
+            text: truncated,
+            style: {
+              fontSize: '0.8em',
+              opacity: 0.75,
+              marginTop: '2px',
+              fontStyle: 'italic',
+              textAlign: 'left',
+              width: '100%',
+              background: 'none',
+              border: 'none',
+              padding: '0',
+              cursor: 'pointer'
+            },
+            callback: async () => { await toggleFlagCoaching(key, flag.sentence, 'tag'); }
+          }
+        ];
+
+        if (isExpanded) {
+          if (isFetching) {
+            cardContent.push({
+              type: 'text',
+              text: '⏳ Fetching coaching...',
+              style: { fontSize: '0.82em', opacity: 0.7, marginTop: '6px', paddingLeft: '4px' }
+            });
+          } else if (cachedResult) {
+            for (const item of buildCoachingResultItems(
+              cachedResult,
+              flag.sentence,
+              async () => { await retryInlineCoaching(key, async () => await coachTags(flag.sentence)); }
+            )) {
+              cardContent.push(item);
+            }
+          }
+        }
+
+        autoContent.push({
+          type: 'box',
+          style: {
+            backgroundColor: 'bg1',
+            padding: '6px 8px',
+            borderRadius: '4px',
+            marginBottom: '4px',
+            borderLeft: `3px solid ${color}`,
+            cursor: 'pointer'
+          },
+          content: cardContent
+        });
+      });
+    }
+
+    // Render auto-detection content directly — no collapsible wrapper needed.
+    // The flag cards themselves are the interactive elements; wrapping them
+    // in a collapsible just adds a pointless extra click.
+    content.push({
+      type: 'text',
+      text: '**🔍 Auto-Detection** — latest generation:',
+      markdown: true,
+      style: { fontSize: '0.9em', marginBottom: '6px' }
+    });
+    for (const item of autoContent) {
+      content.push(item);
+    }
+  }
+
+  // Coaching feed
+  if (state.feed.length > 0) {
+    const feedContent: any[] = [];
+
+    for (const entry of state.feed.slice(0, 10)) {
+      const modeLabel = entry.mode === 'sdt' ? '👁 Show-Don\'t-Tell' :
+                        entry.mode === 'tag' ? '🏷 Action Tag' :
+                        entry.mode === 'general' ? '💬 General' :
+                        entry.mode === 'auto_sdt' ? '👁 Auto SDT' : '🏷 Auto Tag';
+
+      const age = Math.round((Date.now() - entry.timestamp) / 1000);
+      const ageText = age < 60 ? `${age}s ago` :
+                      age < 3600 ? `${Math.round(age / 60)}m ago` :
+                      `${Math.round(age / 3600)}h ago`;
+
+      const borderColor = entry.mode === 'sdt' || entry.mode === 'auto_sdt' ? '#cc9944' :
+                          entry.mode === 'tag' || entry.mode === 'auto_tag' ? '#4499cc' : '#aa88ff';
+
+      // Build retry callback — re-runs the same coach mode on the original passage
+      const capturedEntry = entry;
+      const feedRetryCallback = async () => {
+        if (state.isCoaching) {
+          api.v1.ui.toast('Already coaching — please wait', { type: 'warning' });
+          return;
+        }
+        state.isCoaching = true;
+        await updatePanel();
+        try {
+          let freshFeedback = '';
+          if (capturedEntry.mode === 'sdt') {
+            freshFeedback = await coachSdt(capturedEntry.passage, undefined, 'selection');
+          } else if (capturedEntry.mode === 'tag') {
+            freshFeedback = await coachTags(capturedEntry.passage);
+          } else if (capturedEntry.mode === 'general') {
+            freshFeedback = await coachGeneral(capturedEntry.passage);
+          }
+          if (freshFeedback) {
+            capturedEntry.feedback = freshFeedback;
+            capturedEntry.timestamp = Date.now();
+          }
+        } catch (e) {
+          api.v1.error('Feed retry error:', e);
+          api.v1.ui.toast('Retry failed — check script log', { type: 'error' });
+        } finally {
+          state.isCoaching = false;
+          await updatePanel();
+        }
+      };
+
+      // Render feedback through buildCoachingResultItems so Copy/Retry/Replace buttons appear
+      const feedbackContent: any[] = buildCoachingResultItems(
+        entry.feedback,
+        entry.passage,
+        feedRetryCallback
+      );
+
+      feedContent.push({
+        type: 'box',
+        style: {
+          backgroundColor: 'bg1',
+          padding: '8px',
+          borderRadius: '4px',
+          marginBottom: '8px',
+          borderLeft: `3px solid ${borderColor}`
+        },
+        content: [
+          {
+            type: 'row',
+            spacing: 'space-between',
+            content: [
+              {
+                type: 'text',
+                text: `**${modeLabel}**`,
+                markdown: true,
+                style: { fontSize: '0.85em' }
+              },
+              {
+                type: 'text',
+                text: ageText,
+                style: { fontSize: '0.8em', opacity: 0.6 }
+              }
+            ]
+          },
+          {
+            type: 'text',
+            text: `_"${entry.text}"_`,
+            markdown: true,
+            style: { fontSize: '0.8em', opacity: 0.7, marginBottom: '6px', marginTop: '2px' }
+          },
+          ...feedbackContent
+        ]
+      });
+    }
+
+    content.push({
+      type: 'collapsibleSection',
+      title: `📋 Coaching Feed (${state.feed.length})`,
+      content: feedContent,
+      startOpen: state.feed.length > 0 && !hasAutoFlags
+    });
+  }
+
+  // Empty state
+  if (!hasAutoFlags && state.feed.length === 0 && !state.isCoaching) {
+    content.push({
+      type: 'box',
+      style: {
+        backgroundColor: 'bg1',
+        padding: '12px',
+        borderRadius: '4px',
+        marginTop: '8px'
+      },
+      content: [
+        {
+          type: 'text',
+          text: '_Nothing to show yet._',
+          markdown: true,
+          style: { opacity: 0.6 }
+        },
+        {
+          type: 'text',
+          text: 'Generate some text or select a passage and right-click to get coaching.',
+          style: { fontSize: '0.85em', opacity: 0.5, marginTop: '4px' }
+        }
+      ]
+    });
+  }
+
+  // Clear feed button
+  if (state.feed.length > 0) {
+    content.push({
+      type: 'button',
+      text: '🗑 Clear Feed',
+      style: { fontSize: '0.85em', marginTop: '8px', opacity: 0.6 },
+      callback: async () => {
+        state.feed = [];
+        await updatePanel();
+      }
+    });
+  }
+
+  // Info
+  content.push({
+    type: 'text',
+    text: '_Click a flag card to fetch surgical coaching inline. Right-click document selection for manual sessions._',
+    markdown: true,
+    style: { fontSize: '0.8em', opacity: 0.5, marginTop: '12px' }
+  });
+
+  return content;
+}
+
+async function registerUI(): Promise<void> {
+  await api.v1.ui.register([
+    {
+      type: 'sidebarPanel',
+      id: state.panelId,
+      name: 'Prose Coach',
+      iconId: 'feather',
+      content: buildPanelContent()
+    },
+    {
+      type: 'contextMenuButton',
+      id: 'prose-coach-sdt',
+      text: '👁 Coach: Show-Don\'t-Tell',
+      callback: async ({ selection }) => {
+        if (!selection) {
+          api.v1.ui.toast('Select a passage first', { type: 'warning' });
+          return;
+        }
+        await runContextMenuCoach(selection, 'sdt');
+      }
+    },
+    {
+      type: 'contextMenuButton',
+      id: 'prose-coach-tag',
+      text: '🏷 Coach: Action Tags',
+      callback: async ({ selection }) => {
+        if (!selection) {
+          api.v1.ui.toast('Select a passage first', { type: 'warning' });
+          return;
+        }
+        await runContextMenuCoach(selection, 'tag');
+      }
+    },
+    {
+      type: 'contextMenuButton',
+      id: 'prose-coach-general',
+      text: '💬 Coach: General',
+      callback: async ({ selection }) => {
+        if (!selection) {
+          api.v1.ui.toast('Select a passage first', { type: 'warning' });
+          return;
+        }
+        await runContextMenuCoach(selection, 'general');
+      }
+    }
+  ]);
+}
+
+async function updatePanel(): Promise<void> {
+  await api.v1.ui.update([
+    {
+      type: 'sidebarPanel',
+      id: state.panelId,
+      name: 'Prose Coach',
+      iconId: 'feather',
+      content: buildPanelContent()
+    }
+  ]);
+}
+
+// ============================================================================
+// HOOKS
+// ============================================================================
+
+function registerHooks(): void {
+  // After generation: run auto-analysis (debounced 400ms)
+  api.v1.hooks.register('onGenerationEnd', async () => {
+    if (state.generationDebounceTimer !== null) {
+      api.v1.timers.clearTimeout(state.generationDebounceTimer);
+      state.generationDebounceTimer = null;
+    }
+
+    await loadConfig();
+    if (!state.config.enableAutoScan) {
+      return;
+    }
+
+    state.generationDebounceTimer = await api.v1.timers.setTimeout(async () => {
+      state.generationDebounceTimer = null;
+      if (!state.config.enableAutoScan) return;
+      await runAutoAnalysis();
+    }, 400);
+  });
+}
+
+// ============================================================================
+// ENTRY POINT
+// ============================================================================
+
+(async () => {
+  await loadConfig();
+  await registerUI();
+  registerHooks();
+})();
