@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1776512982753
-version: 2.7.5
+version: 2.7.6
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -182,6 +182,7 @@ async function copyAvatarBridgeInstallLink() {
 
 async function describeCharacterAppearance(character) {
   const source = String(character.text || "")
+    .replace(/^\s*Appearance\s*:[^\r\n]*/gim, "")
     .replace(/data:image\/[^;]+;base64,[^\s]+/g, "")
     .slice(0, 6000);
   if (!source.trim()) return "";
@@ -217,6 +218,34 @@ async function describeCharacterAppearance(character) {
   };
 }
 
+async function saveCharacterAppearanceToLorebook(character, description) {
+  if (!(await api.v1.permissions.request("lorebookEdit"))) return false;
+
+  const entries = await api.v1.lorebook.entries();
+  const entry = entries.find(item => item.id === character.id);
+  if (!entry) return false;
+
+  const lines = String(entry.text || "").split(/\r?\n/);
+  const updatedLines = [];
+  let replaced = false;
+  for (const line of lines) {
+    if (/^\s*Appearance\s*:/i.test(line)) {
+      if (!replaced) {
+        updatedLines.push(`Appearance: ${description}`);
+        replaced = true;
+      }
+    } else {
+      updatedLines.push(line);
+    }
+  }
+  if (!replaced) updatedLines.push(`Appearance: ${description}`);
+
+  await api.v1.lorebook.updateEntry(entry.id, {
+    text: updatedLines.join("\n")
+  });
+  return true;
+}
+
 async function generateCharacterAvatar(character) {
   if (!(await connectAvatarBridge())) {
     await api.v1.ui.toast("Character Engine Bridge is not connected; keeping the default avatar.", { type: "warning" });
@@ -235,6 +264,17 @@ async function generateCharacterAvatar(character) {
   if (!appearance.description) {
     await api.v1.ui.toast(`No visual details found for ${character.name}; keeping the default avatar.`, { type: "warning" });
     return null;
+  }
+  api.v1.log(`[Character Avatar Appearance] ${character.name}: ${appearance.description}`);
+  try {
+    if (await saveCharacterAppearanceToLorebook(character, appearance.description)) {
+      await api.v1.ui.toast(`Appearance summary saved to ${character.name}'s Lorebook entry.`, { type: "success" });
+    } else {
+      await api.v1.ui.toast(`Appearance summary for ${character.name} is in the script log; Lorebook edit permission was not granted.`, { type: "warning" });
+    }
+  } catch (error) {
+    api.v1.error("Could not save character appearance to Lorebook:", error);
+    await api.v1.ui.toast(`Appearance summary for ${character.name} is in the script log but could not be saved to the Lorebook.`, { type: "warning" });
   }
 
   const requestId = api.v1.uuid();
