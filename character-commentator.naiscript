@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1776512982753
-version: 2.7.6
+version: 2.7.7
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -187,7 +187,6 @@ async function describeCharacterAppearance(character) {
     .slice(0, 6000);
   if (!source.trim()) return "";
 
-  const selectedModel = await api.v1.config.get("generationModel");
   const response = await api.v1.generate(
     [
       {
@@ -199,7 +198,7 @@ async function describeCharacterAppearance(character) {
         content: `Character name: ${character.name}\nCharacter lorebook entry:\n${source}`
       }
     ],
-    { model: selectedModel, max_tokens: 120, temperature: 0.2 },
+    { model: "glm-4-6", max_tokens: 120, temperature: 0.2 },
     undefined,
     "background"
   );
