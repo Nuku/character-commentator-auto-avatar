@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1776512982753
-version: 2.7.2
+version: 2.7.3
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -106,8 +106,10 @@ const DEFAULT_AVATAR_STORAGE_KEY = "character-commentator-default-avatar";
 const SOLO_SPEAKER_STORAGE_KEY = "character-commentator-solo-speaker";
 const AVATAR_BRIDGE_RESULT_EVENT = "CC_AVATAR_GENERATION_RESULT";
 const AVATAR_BRIDGE_TIMEOUT_MS = 240000;
+const AVATAR_BRIDGE_INSTALL_URL = "https://github.com/Nuku/character-commentator-auto-avatar/blob/main/Bridge.js";
 let avatarBridgeSubscribed = false;
 let avatarBridgeReady = false;
+let avatarBridgeMissing = false;
 const avatarBridgeWaiters = [];
 const pendingAvatarGenerations = new Map();
 
@@ -117,6 +119,7 @@ async function handleAvatarBridgeMessage(message) {
     : (message && message.data ? message.data : {});
   if (payload.event === "HANDSHAKE_ACK") {
     avatarBridgeReady = true;
+    avatarBridgeMissing = false;
     while (avatarBridgeWaiters.length) avatarBridgeWaiters.shift()(true);
     return;
   }
@@ -163,7 +166,18 @@ async function connectAvatarBridge() {
   }, "hypebot");
   const ready = avatarBridgeReady || await readyPromise;
   if (readyTimeout) api.v1.timers.clearTimeout(readyTimeout);
+  avatarBridgeMissing = !ready;
   return ready;
+}
+
+async function copyAvatarBridgeInstallLink() {
+  try {
+    await api.v1.clipboard.writeText(AVATAR_BRIDGE_INSTALL_URL);
+    await api.v1.ui.toast("Bridge page link copied. Paste it into your browser to open the script.", { type: "success" });
+  } catch (error) {
+    api.v1.error("Could not copy the bridge page link:", error);
+    await api.v1.ui.toast(`Open this bridge page: ${AVATAR_BRIDGE_INSTALL_URL}`, { type: "warning" });
+  }
 }
 
 async function generateCharacterAvatar(character) {
@@ -1570,7 +1584,13 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
                   });
                 }
               }
-            }] : [{
+            }, ...(avatarBridgeMissing ? [{
+              type: "button",
+              text: "Copy Bridge Link",
+              iconId: "external-link",
+              style: { fontSize: '12px', marginBottom: '0' },
+              callback: copyAvatarBridgeInstallLink
+            }] : [])] : [{
               type: "button",
               text: "Clear Avatar",
               iconId: "image-off",
