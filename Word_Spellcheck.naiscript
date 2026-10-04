@@ -1,0 +1,285 @@
+/*---
+compatibilityVersion: naiscript-1.0
+id: 1d820564-64c4-4b9c-9e36-7638af2d3e1f
+name: Word Spellcheck Helper
+createdAt: 1777795200000
+updatedAt: 1777824000000
+version: 1.0.1
+author: dmssi
+description: "Checks a single selected word for likely spelling correctness and suggests five alternatives when needed."
+memoryLimit: 64
+config: []
+---*/
+
+const CONTEXT_ACTION_ID = "word-spellcheck-helper-context-menu";
+const MODEL = "glm-4-6";
+const CONTEXT_CHARS = 120;
+
+type SpellcheckResult = {
+  correct: boolean;
+  word: string;
+  suggestions: string[];
+  note?: string;
+};
+
+type SelectedWord = {
+  text: string;
+  context: string;
+  leadingText: string;
+  leadingPunctuation: string;
+  trailingPunctuation: string;
+  trailingText: string;
+  selection: DocumentSelection;
+};
+
+type NormalizedSelection = {
+  word: string;
+  leadingText: string;
+  leadingPunctuation: string;
+  trailingPunctuation: string;
+  trailingText: string;
+};
+
+function contextAroundSelection(paragraphText: string, selection: DocumentSelection): string {
+  const start = Math.max(0, selection.from.offset - CONTEXT_CHARS);
+  const end = Math.min(paragraphText.length, selection.to.offset + CONTEXT_CHARS);
+  const before = paragraphText.slice(start, selection.from.offset);
+  const selected = paragraphText.slice(selection.from.offset, selection.to.offset);
+  const after = paragraphText.slice(selection.to.offset, end);
+
+  return `${before}[[${selected}]]${after}`;
+}
+
+async function paragraphTextForSelection(selection: DocumentSelection): Promise<string | undefined> {
+  let paragraphText = "";
+  let foundSection = false;
+  await api.v1.document.scan((sectionId, section) => {
+    if (sectionId === selection.from.sectionId) {
+      paragraphText = section.text;
+      foundSection = true;
+    }
+  });
+  return foundSection ? paragraphText : undefined;
+}
+
+function normalizeSelectedWord(text: string): NormalizedSelection | undefined {
+  const match = text.match(/^(\s*)([\s\S]*?)(\s*)$/u);
+  if (!match) {
+    return undefined;
+  }
+
+  const leadingText = match[1];
+  const trailingText = match[3];
+  const innerText = match[2];
+  if (!innerText) {
+    return undefined;
+  }
+
+  const wordMatch = innerText.match(/^([^\p{L}\p{M}'-]*)([\p{L}\p{M}]+(?:['-][\p{L}\p{M}]+)*)([^\p{L}\p{M}'-]*)$/u);
+  if (!wordMatch) {
+    return undefined;
+  }
+
+  const leadingPunctuation = wordMatch[1];
+  const word = wordMatch[2];
+  const trailingPunctuation = wordMatch[3];
+  if (!word || /\s/u.test(leadingPunctuation + trailingPunctuation)) {
+    return undefined;
+  }
+
+  return { word, leadingText, leadingPunctuation, trailingPunctuation, trailingText };
+}
+
+function parseSpellcheckResult(rawText: string, fallbackWord: string): SpellcheckResult {
+  const jsonMatch = rawText.match(/\{[\s\S]*\}/u);
+  if (!jsonMatch) {
+    throw new Error("Spellcheck response did not contain JSON.");
+  }
+
+  const parsed = JSON.parse(jsonMatch[0]) as Partial<SpellcheckResult>;
+  const suggestions = Array.isArray(parsed.suggestions)
+    ? parsed.suggestions.filter((value): value is string => typeof value === "string").slice(0, 5)
+    : [];
+
+  return {
+    correct: parsed.correct === true,
+    word: typeof parsed.word === "string" && parsed.word.trim() ? parsed.word.trim() : fallbackWord,
+    suggestions,
+    note: typeof parsed.note === "string" ? parsed.note.trim() : undefined,
+  };
+}
+
+function resultMarkdown(result: SpellcheckResult): string {
+  if (result.correct) {
+    return `**${result.word}** appears to be spelled correctly.`;
+  }
+
+  return `**${result.word}** may be misspelled.\n\nClick a suggestion to replace the selected word.`;
+}
+
+async function replaceSelectedWord(selectedWord: SelectedWord, replacement: string): Promise<boolean> {
+  if (selectedWord.selection.from.sectionId !== selectedWord.selection.to.sectionId) {
+    await api.v1.ui.toast("Replacement skipped because the selection spans more than one paragraph.", {
+      type: "warning",
+    });
+    return false;
+  }
+
+  const hasPermission = await api.v1.permissions.has("documentEdit");
+  if (!hasPermission) {
+    const granted = await api.v1.permissions.request(
+      "documentEdit",
+      "Word Spellcheck Helper needs permission to edit the document in order to replace the selected word.",
+    );
+    if (!granted) {
+      await api.v1.ui.toast("Permission denied - cannot replace the selected word.", {
+        type: "warning",
+      });
+      return false;
+    }
+  }
+
+  const currentSelectedText = await api.v1.document.textFromSelection({
+    from: selectedWord.selection.from,
+    to: selectedWord.selection.to,
+  });
+  const currentSelection = normalizeSelectedWord(currentSelectedText);
+  if (!currentSelection || currentSelection.word !== selectedWord.text) {
+    await api.v1.ui.toast("Replacement skipped because the selected text changed.", {
+      type: "warning",
+    });
+    return false;
+  }
+
+  const targetText = await paragraphTextForSelection(selectedWord.selection);
+
+  if (targetText === undefined) {
+    await api.v1.ui.toast("Could not find the selected word in the document.", {
+      type: "error",
+    });
+    return false;
+  }
+
+  const updatedText =
+    targetText.slice(0, selectedWord.selection.from.offset) +
+    selectedWord.leadingText +
+    selectedWord.leadingPunctuation +
+    replacement +
+    selectedWord.trailingPunctuation +
+    selectedWord.trailingText +
+    targetText.slice(selectedWord.selection.to.offset);
+
+  await api.v1.document.updateParagraph(selectedWord.selection.from.sectionId, {
+    text: updatedText,
+  });
+  await api.v1.ui.toast(`Replaced "${selectedWord.text}" with "${replacement}".`, {
+    type: "success",
+  });
+  return true;
+}
+
+async function showResult(title: string, result: SpellcheckResult, selectedWord: SelectedWord): Promise<void> {
+  let modal: any;
+  const content: any[] = [
+    {
+      type: "text",
+      text: resultMarkdown(result),
+      markdown: true,
+    },
+  ];
+
+  if (!result.correct && result.suggestions.length > 0) {
+    result.suggestions.forEach((suggestion, index) => {
+      content.push({
+        type: "button",
+        text: `${index + 1}. ${suggestion}`,
+        callback: async () => {
+          const replaced = await replaceSelectedWord(selectedWord, suggestion);
+          if (replaced && modal) {
+            await modal.close();
+          }
+        },
+      });
+    });
+  }
+
+  modal = await api.v1.ui.modal.open({
+    title,
+    size: "small",
+    content,
+  });
+}
+
+async function checkSelectedWord(selection: DocumentSelection): Promise<void> {
+  try {
+    const selectedText = await api.v1.document.textFromSelection({
+      from: selection.from,
+      to: selection.to,
+    });
+    const normalizedSelection = normalizeSelectedWord(selectedText);
+
+    if (!normalizedSelection) {
+      await api.v1.ui.toast("Select exactly one word before running Word Spellcheck Helper.", {
+        type: "warning",
+      });
+      return;
+    }
+
+    const word = normalizedSelection.word;
+    const paragraphText = await paragraphTextForSelection(selection);
+    const context = paragraphText !== undefined
+      ? contextAroundSelection(paragraphText, selection)
+      : `[[${selectedText}]]`;
+    const selectedWord = {
+      text: word,
+      context,
+      leadingText: normalizedSelection.leadingText,
+      leadingPunctuation: normalizedSelection.leadingPunctuation,
+      trailingPunctuation: normalizedSelection.trailingPunctuation,
+      trailingText: normalizedSelection.trailingText,
+      selection,
+    };
+    await api.v1.ui.toast(`Checking "${word}"...`, { type: "info" });
+
+    const response = await api.v1.generate(
+      [
+        {
+          role: "system",
+          content:
+            "You are a precise spelling checker. Decide whether the selected word is likely spelled correctly in its local story context. The selected text is marked with [[double brackets]]. Judge only that selected word, not surrounding words. Account for proper nouns, contractions, hyphenated words, archaisms, invented names, fantasy terminology, dialect, and homophones when context supports them. Respond only as compact JSON with keys: correct boolean, word string, suggestions string array, note string. If correct is true, suggestions must be an empty array. If correct is false, provide exactly five suggestions in descending likelihood.",
+        },
+        {
+          role: "user",
+          content: `Selected word: ${JSON.stringify(word)}\nLocal context: ${JSON.stringify(context)}`,
+        },
+      ],
+      {
+        model: MODEL,
+        max_tokens: 180,
+        temperature: 0.1,
+        top_p: 0.8,
+      },
+      undefined,
+      "blocking",
+    );
+
+    const result = parseSpellcheckResult(response.choices[0]?.text ?? "", word);
+    await showResult("Word Spellcheck", result, selectedWord);
+  } catch (error) {
+    api.v1.error("Word Spellcheck Helper failed:", error);
+    await api.v1.ui.toast("Word Spellcheck Helper failed. Check the script log for details.", {
+      type: "error",
+    });
+  }
+}
+
+api.v1.ui.register([
+  {
+    type: "contextMenuButton",
+    id: CONTEXT_ACTION_ID,
+    text: "Check Spelling",
+    callback: ({ selection }) => {
+      void checkSelectedWord(selection);
+    },
+  },
+]);
