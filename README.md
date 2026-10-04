@@ -24,3 +24,5 @@ Image generation uses the bridge's NovelAI image-generation integration. If the 
 ## Notes
 
 The bridge source is based on Character Engine Bridge v3.0.36; this fork adds a reply containing the generated data URI for callers that provide `replyToSid` and `requestId`. The existing authorship and license headers are preserved in the source files.
+
+If the bridge handshake is not detected, Character Commentator shows a **Copy Bridge Link** button. NovelAI's supported script UI does not provide an external-page navigation API, so the button copies the public bridge source URL for the user to open.
