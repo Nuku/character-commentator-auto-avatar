@@ -1,0 +1,1694 @@
+/*---
+compatibilityVersion: naiscript-1.0
+id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
+name: Character Commentator
+createdAt: 1739139600000
+updatedAt: 1776512982753
+version: 2.7.2
+author: Claude
+description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
+memoryLimit: 16
+config:
+  - name: commentChance
+    prettyName: Comment Probability
+    type: number
+    default: 0.8
+    description: Probability that a comment will be generated after each generation (0.0 = never, 1.0 = always)
+    min: "0"
+    max: "1"
+  - name: contextParagraphs
+    prettyName: Context Paragraphs
+    type: number
+    default: 5
+    description: Number of recent paragraphs to include as context for the character's comment
+    min: "1"
+    max: "20"
+  - name: maxCommentTokens
+    prettyName: Maximum Comment Length (tokens)
+    type: number
+    default: 150
+    description: Maximum tokens for the character's comment
+    min: "50"
+    max: "500"
+  - name: commentTemperature
+    prettyName: Comment Temperature
+    type: number
+    default: 0.9
+    description: Temperature for comment generation (higher = more creative/varied)
+    min: "0.1"
+    max: "2.0"
+  - name: autoShow
+    prettyName: Auto-Show Comments
+    type: boolean
+    default: true
+    description: Automatically show the comment bot after generation (disable to only show when manually triggered)
+  - name: minLorebookTextLength
+    prettyName: Minimum Lorebook Entry Length
+    type: number
+    default: 20
+    description: Minimum character count for lorebook entries to be considered (filters out stub entries)
+    min: "1"
+    max: "1000"
+  - name: characterAvatarImage
+    prettyName: Character Avatar Image
+    type: string
+    default: ""
+    description: "Avatar image for all character comments (leave empty for default HypeBot avatar). Must be a base64 data URI starting with 'data:image/' - convert images at: https://www.base64-image.de/"
+  - name: avatarLorebookName
+    prettyName: Avatar Lorebook Name
+    type: string
+    default: "Avatars"
+    description: "Name of the lorebook containing character avatars (one per line: 'CharacterName: base64data'). Leave empty to disable this feature and use only the default avatar above."
+  - name: characterCategoryName
+    prettyName: Character Category Name
+    type: string
+    default: ""
+    description: "Name of a lorebook category - all entries in this category are automatically treated as characters (no 'Type: Character' needed). Leave empty to only detect entries with 'Type: Character' marker."
+  - name: maxCharacterButtons
+    prettyName: Max Character Buttons
+    type: number
+    default: "5"
+    min: "1"
+    max: "20"
+    description: "Maximum number of character selection buttons to show. If you have more characters than this, a random selection will be displayed. Set to 20 to show all characters."
+  - name: investmentBasedSelection
+    prettyName: Investment-Based Selection
+    type: boolean
+    default: false
+    description: "When enabled, analyzes which character's lorebook info is most relevant to recent story events. The most invested character gets double the chance to comment. Works alongside contextual name-based selection."
+  - name: generationModel
+    prettyName: Generation Model
+    type: string
+    default: "glm-4-6"
+    description: "AI model to use for generating character comments. glm-4-6 is the standard model, xialong-v1 is newer."
+    options:
+      - label: "GLM-4-6 (Standard)"
+        value: "glm-4-6"
+      - label: "Xialong-v1 (New)"
+        value: "xialong-v1"
+---*/
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+// All configuration is now managed through the script settings UI
+// Access settings via: await api.v1.script.config.<configName>()
+
+// ============================================================================
+// State Management
+// ============================================================================
+
+let isGeneratingComment = false;
+let currentChatCharacter = null; // Track which character user is chatting with
+let chatWindowOpen = false; // Track if chat window is open
+const DEFAULT_AVATAR_STORAGE_KEY = "character-commentator-default-avatar";
+const SOLO_SPEAKER_STORAGE_KEY = "character-commentator-solo-speaker";
+const AVATAR_BRIDGE_RESULT_EVENT = "CC_AVATAR_GENERATION_RESULT";
+const AVATAR_BRIDGE_TIMEOUT_MS = 240000;
+let avatarBridgeSubscribed = false;
+let avatarBridgeReady = false;
+const avatarBridgeWaiters = [];
+const pendingAvatarGenerations = new Map();
+
+async function handleAvatarBridgeMessage(message) {
+  const payload = message && message.data && message.data.payload
+    ? message.data.payload
+    : (message && message.data ? message.data : {});
+  if (payload.event === "HANDSHAKE_ACK") {
+    avatarBridgeReady = true;
+    while (avatarBridgeWaiters.length) avatarBridgeWaiters.shift()(true);
+    return;
+  }
+  if (payload.event !== AVATAR_BRIDGE_RESULT_EVENT || !payload.requestId) return;
+  const pending = pendingAvatarGenerations.get(payload.requestId);
+  if (!pending) return;
+  pendingAvatarGenerations.delete(payload.requestId);
+  pending(payload);
+}
+
+async function connectAvatarBridge() {
+  if (!avatarBridgeSubscribed) {
+    await api.v1.messaging.onMessage(handleAvatarBridgeMessage);
+    avatarBridgeSubscribed = true;
+  }
+  if (avatarBridgeReady) return true;
+
+  let readyTimeout;
+  const readyPromise = new Promise(resolve => {
+    const settle = ready => {
+      const index = avatarBridgeWaiters.indexOf(settle);
+      if (index >= 0) avatarBridgeWaiters.splice(index, 1);
+      if (readyTimeout) api.v1.timers.clearTimeout(readyTimeout);
+      resolve(ready);
+    };
+    avatarBridgeWaiters.push(settle);
+    readyTimeout = api.v1.timers.setTimeout(() => settle(false), 5000);
+  });
+
+  await api.v1.messaging.broadcast({
+    type: "HANDSHAKE", sid: api.v1.script.id,
+    payload: { handshake: "NAI_SCRIPT:IN" }
+  });
+  await api.v1.messaging.broadcast({
+    type: "HANDSHAKE", sid: api.v1.script.id,
+    payload: { handshake: "NAI_SCRIPT:OUT" }
+  });
+  await api.v1.messaging.broadcast({
+    type: "MESSAGE", sid: api.v1.script.id,
+    payload: {
+      event: "HANDSHAKE_REQUEST", scriptId: api.v1.script.id,
+      engine: "CC", engineName: api.v1.script.name, engineVersion: api.v1.script.version
+    }
+  }, "hypebot");
+  const ready = avatarBridgeReady || await readyPromise;
+  if (readyTimeout) api.v1.timers.clearTimeout(readyTimeout);
+  return ready;
+}
+
+async function generateCharacterAvatar(character) {
+  if (!(await connectAvatarBridge())) {
+    await api.v1.ui.toast("Character Engine Bridge is not connected; keeping the default avatar.", { type: "warning" });
+    return null;
+  }
+
+  const requestId = api.v1.uuid();
+  const lore = String(character.text || "").replace(/data:image\/[^;]+;base64,[^\s]+/g, "").slice(0, 2200);
+  const resultPromise = new Promise(resolve => {
+    pendingAvatarGenerations.set(requestId, resolve);
+    api.v1.timers.setTimeout(() => {
+      if (pendingAvatarGenerations.has(requestId)) {
+        pendingAvatarGenerations.delete(requestId);
+        resolve({ error: "Image generation timed out." });
+      }
+    }, AVATAR_BRIDGE_TIMEOUT_MS);
+  });
+
+  await api.v1.ui.toast(`Generating an avatar for ${character.name}…`, { type: "info" });
+  try {
+    await api.v1.messaging.broadcast({
+      type: "MESSAGE", sid: api.v1.script.id,
+      payload: {
+        event: "GENERATE_IMAGE", kind: "commentatorAvatar", uuid: requestId,
+        requestId, replyToSid: api.v1.script.id,
+        prompt: "anime portrait, head and shoulders, looking at viewer, simple background",
+        extraBaseVisuals: "best quality, very aesthetic, detailed character portrait",
+        extraBaseUC: "lowres, worst quality, bad anatomy, bad hands, text, watermark",
+        characters: [{ name: character.name, visuals: lore, uc: "" }],
+        settings: {
+          model: "nai-diffusion-4-5-full", width: 832, height: 1216,
+          scale: 5, steps: 28, seed: 0, quality: "best quality",
+          negative: "lowres, worst quality, bad anatomy, bad hands, text, watermark"
+        }
+      }
+    }, "hypebot");
+  } catch (error) {
+    pendingAvatarGenerations.delete(requestId);
+    throw error;
+  }
+
+  const result = await resultPromise;
+  if (!result.imageData || !result.imageData.startsWith("data:image/")) {
+    throw new Error(result.error || "The bridge returned no image data.");
+  }
+  if (!(await saveCharacterAvatarToLorebook(character.name, result.imageData))) return null;
+  await api.v1.ui.toast(`Generated and saved an avatar for ${character.name}.`, { type: "success" });
+  return result.imageData;
+}
+
+// Safety function to reset generation flag if it gets stuck
+function setGenerationFlag(value) {
+  isGeneratingComment = value;
+  
+  // If setting to true, create a safety timeout
+  // We don't clear old timeouts - they're harmless and will just check the flag
+  if (value === true) {
+    api.v1.timers.setTimeout(() => {
+      if (isGeneratingComment) {
+        isGeneratingComment = false;
+      }
+    }, 30000); // 30 second timeout
+  }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/**
+ * Resolve an image URL to base64 data that can be used by commentBot
+ * @param imageUrl URL string or base64 data URI
+ * @returns base64 data string or null
+ */
+async function resolveImageUrl(imageUrl) {
+  if (!imageUrl || imageUrl.trim() === '') {
+    return null;
+  }
+  
+  const trimmedUrl = imageUrl.trim();
+  
+  // If it's already a base64 data URI, return as-is
+  if (trimmedUrl.startsWith('data:image/')) {
+    return trimmedUrl;
+  }
+  
+  // For regular URLs, return null (only base64 data URIs are supported)
+  return null;
+}
+
+/**
+ * Get the uploaded default avatar if one exists, otherwise fall back to config
+ * @returns base64 data string or null
+ */
+async function getDefaultAvatarImage() {
+  const uploadedAvatar = await api.v1.storage.get(DEFAULT_AVATAR_STORAGE_KEY);
+  const resolvedUploadedAvatar = await resolveImageUrl(uploadedAvatar);
+  if (resolvedUploadedAvatar) {
+    return resolvedUploadedAvatar;
+  }
+  
+  const configuredAvatar = await api.v1.config.get("characterAvatarImage");
+  return await resolveImageUrl(configuredAvatar);
+}
+
+/**
+ * Prompt the user to upload a default avatar image and store it as a data URI
+ */
+async function promptForDefaultAvatarUpload() {
+  const hasPermission = await api.v1.permissions.request("fileInput");
+  if (!hasPermission) {
+    await api.v1.ui.toast("File input permission is required to upload an avatar.", {
+      type: "warning"
+    });
+    return;
+  }
+  
+  const imageData = await api.v1.file.prompt({
+    accept: "image/*",
+    readAs: "dataURL"
+  });
+  
+  if (!imageData) {
+    return;
+  }
+  
+  await api.v1.storage.set(DEFAULT_AVATAR_STORAGE_KEY, imageData);
+  await api.v1.ui.toast("Default avatar uploaded.", {
+    type: "success"
+  });
+}
+
+/**
+ * Clear the uploaded default avatar override
+ */
+async function clearUploadedDefaultAvatar() {
+  await api.v1.storage.remove(DEFAULT_AVATAR_STORAGE_KEY);
+  await api.v1.ui.toast("Uploaded default avatar cleared.", {
+    type: "success"
+  });
+}
+
+/**
+ * Get the name of the character locked as the only speaker
+ * @returns Character name or null if random speaker mode is active
+ */
+async function getSoloSpeakerName() {
+  const storedName = await api.v1.storyStorage.get(SOLO_SPEAKER_STORAGE_KEY);
+  return storedName && storedName.trim() !== '' ? storedName.trim() : null;
+}
+
+/**
+ * Enable solo speaker mode for a specific character
+ * @param characterName The character who should be the only speaker
+ */
+async function setSoloSpeakerName(characterName) {
+  await api.v1.storyStorage.set(SOLO_SPEAKER_STORAGE_KEY, characterName);
+  await api.v1.ui.toast(`${characterName} will now be the only speaker.`, {
+    type: "success"
+  });
+}
+
+/**
+ * Disable solo speaker mode and return to random speaker selection
+ */
+async function clearSoloSpeakerName() {
+  await api.v1.storyStorage.remove(SOLO_SPEAKER_STORAGE_KEY);
+  await api.v1.ui.toast("Returned to random speakers.", {
+    type: "success"
+  });
+}
+
+/**
+ * Parse markdown-like formatting in text and return styled UI parts
+ * Supports: *italic*, **bold**, ***bold italic***
+ * @param text The text to parse
+ * @param baseStyle Base style object to apply to all parts
+ * @returns Array of UI text parts with appropriate styling
+ */
+function parseMarkdown(text, baseStyle = {}) {
+  const parts = [];
+  let currentIndex = 0;
+  
+  // Regex to match markdown patterns: ***text***, **text**, or *text*
+  const markdownRegex = /(\*\*\*([^*]+)\*\*\*|\*\*([^*]+)\*\*|\*([^*]+)\*)/g;
+  
+  let match;
+  while ((match = markdownRegex.exec(text)) !== null) {
+    // Add any text before this match
+    if (match.index > currentIndex) {
+      const plainText = text.substring(currentIndex, match.index);
+      parts.push({
+        type: "text",
+        text: plainText,
+        style: { ...baseStyle, display: 'inline', whiteSpace: 'pre-wrap' }
+      });
+    }
+    
+    // Determine the style based on which group matched
+    let matchedText;
+    let style = { ...baseStyle, display: 'inline', whiteSpace: 'pre-wrap' };
+    
+    if (match[2]) {
+      // ***bold italic***
+      matchedText = match[2];
+      style.fontWeight = 'bold';
+      style.fontStyle = 'italic';
+    } else if (match[3]) {
+      // **bold**
+      matchedText = match[3];
+      style.fontWeight = 'bold';
+    } else if (match[4]) {
+      // *italic*
+      matchedText = match[4];
+      style.fontStyle = 'italic';
+    }
+    
+    parts.push({
+      type: "text",
+      text: matchedText,
+      style: style
+    });
+    
+    currentIndex = match.index + match[0].length;
+  }
+  
+  // Add any remaining text after the last match
+  if (currentIndex < text.length) {
+    const remainingText = text.substring(currentIndex);
+    parts.push({
+      type: "text",
+      text: remainingText,
+      style: { ...baseStyle, display: 'inline', whiteSpace: 'pre-wrap' }
+    });
+  }
+  
+  // If no markdown was found, return single text part
+  if (parts.length === 0) {
+    parts.push({
+      type: "text",
+      text: text,
+      style: { ...baseStyle, display: 'inline', whiteSpace: 'pre-wrap' }
+    });
+  }
+  
+  return parts;
+}
+
+/**
+ * Get avatar for a character from the avatar lorebook
+ * @param characterName The name of the character
+ * @returns base64 data URI or null if not found
+ */
+async function getAvatarFromLorebook(characterName) {
+  try {
+    const { entry: avatarLorebook } = await getAvatarLorebookEntry();
+    
+    if (!avatarLorebook || !avatarLorebook.text) {
+      return null;
+    }
+    
+    // Parse the avatar lorebook text for "Name: base64data" lines
+    const lines = avatarLorebook.text.split('\n');
+    const fullNameLower = characterName.toLowerCase();
+    const firstNameLower = characterName.includes(' ') ? characterName.split(' ')[0].toLowerCase() : null;
+    
+    for (const line of lines) {
+      const colonIndex = line.indexOf(':');
+      if (colonIndex === -1) continue;
+      
+      const namePart = line.substring(0, colonIndex).trim().toLowerCase();
+      const dataPart = line.substring(colonIndex + 1).trim();
+      
+      // Check for exact match or first name match
+      if (namePart === fullNameLower || (firstNameLower && namePart === firstNameLower)) {
+        // Validate it's a base64 data URI
+        if (dataPart.startsWith('data:image/')) {
+          return dataPart;
+        }
+      }
+    }
+    
+    return null;
+  } catch (error) {
+    // Silently fail if we can't access the avatar lorebook
+    return null;
+  }
+}
+
+/**
+ * Get the lorebook entry used to store per-character avatars
+ * @returns object containing the lorebook name and matching entry if found
+ */
+async function getAvatarLorebookEntry() {
+  const configuredName = await api.v1.config.get("avatarLorebookName");
+  const lorebookName = configuredName && configuredName.trim() !== '' ? configuredName.trim() : 'Avatars';
+  const entries = await api.v1.lorebook.entries();
+  const entry = entries.find(item =>
+    item.displayName && item.displayName.toLowerCase() === lorebookName.toLowerCase()
+  );
+  
+  return { lorebookName, entry: entry || null };
+}
+
+/**
+ * Save or update a per-character avatar in the avatar lorebook entry
+ * @param characterName The name of the character
+ * @param imageData The image data URI
+ */
+async function saveCharacterAvatarToLorebook(characterName, imageData) {
+  const hasPermission = await api.v1.permissions.request("lorebookEdit");
+  if (!hasPermission) {
+    await api.v1.ui.toast("Lorebook edit permission is required to save character avatars.", {
+      type: "warning"
+    });
+    return false;
+  }
+
+  const { lorebookName, entry } = await getAvatarLorebookEntry();
+  const normalizedName = characterName.trim().toLowerCase();
+  const existingLines = entry && entry.text ? entry.text.split('\n') : [];
+  let replaced = false;
+  
+  const updatedLines = existingLines.map(line => {
+    const colonIndex = line.indexOf(':');
+    if (colonIndex === -1) {
+      return line;
+    }
+    
+    const namePart = line.substring(0, colonIndex).trim().toLowerCase();
+    if (namePart === normalizedName) {
+      replaced = true;
+      return `${characterName}: ${imageData}`;
+    }
+    
+    return line;
+  });
+  
+  if (!replaced) {
+    updatedLines.push(`${characterName}: ${imageData}`);
+  }
+  
+  const newText = updatedLines.filter(line => line.trim().length > 0).join('\n');
+  
+  if (entry) {
+    await api.v1.lorebook.updateEntry(entry.id, { text: newText });
+  } else {
+    await api.v1.lorebook.createEntry({
+      displayName: lorebookName,
+      text: newText,
+      enabled: true,
+      forceActivation: false,
+      keys: []
+    });
+  }
+
+  return true;
+}
+
+/**
+ * Prompt the user to upload a per-character avatar and store it in the avatar lorebook
+ * @param characterName The name of the character
+ * @returns Uploaded image data or null if cancelled
+ */
+async function promptForCharacterAvatarUpload(characterName) {
+  const hasPermission = await api.v1.permissions.request("fileInput");
+  if (!hasPermission) {
+    await api.v1.ui.toast("File input permission is required to upload a character avatar.", {
+      type: "warning"
+    });
+    return null;
+  }
+  
+  const imageData = await api.v1.file.prompt({
+    accept: "image/*",
+    readAs: "dataURL"
+  });
+  
+  if (!imageData) {
+    return null;
+  }
+  
+  const wasSaved = await saveCharacterAvatarToLorebook(characterName, imageData);
+  if (!wasSaved) {
+    return null;
+  }
+
+  await api.v1.ui.toast(`Avatar saved for ${characterName}.`, {
+    type: "success"
+  });
+  return imageData;
+}
+
+/**
+ * Remove a per-character avatar from the avatar lorebook entry
+ * @param characterName The name of the character
+ * @returns True if the avatar was removed, false otherwise
+ */
+async function clearCharacterAvatarFromLorebook(characterName) {
+  const hasPermission = await api.v1.permissions.request("lorebookEdit");
+  if (!hasPermission) {
+    await api.v1.ui.toast("Lorebook edit permission is required to clear character avatars.", {
+      type: "warning"
+    });
+    return false;
+  }
+
+  const { entry } = await getAvatarLorebookEntry();
+  if (!entry || !entry.text) {
+    return false;
+  }
+
+  const normalizedName = characterName.trim().toLowerCase();
+  const existingLines = entry.text.split('\n');
+  const filteredLines = existingLines.filter(line => {
+    const colonIndex = line.indexOf(':');
+    if (colonIndex === -1) {
+      return true;
+    }
+
+    const namePart = line.substring(0, colonIndex).trim().toLowerCase();
+    return namePart !== normalizedName;
+  });
+
+  if (filteredLines.length === existingLines.length) {
+    return false;
+  }
+
+  await api.v1.lorebook.updateEntry(entry.id, {
+    text: filteredLines.filter(line => line.trim().length > 0).join('\n')
+  });
+
+  await api.v1.ui.toast(`Avatar cleared for ${characterName}.`, {
+    type: "success"
+  });
+  return true;
+}
+
+/**
+ * Get all relevant lorebook entries that could represent characters
+ */
+async function getCharacterEntries() {
+  const entries = await api.v1.lorebook.entries();
+  const minTextLength = await api.v1.config.get("minLorebookTextLength");
+  const characterCategoryName = await api.v1.config.get("characterCategoryName");
+  
+  api.v1.log(`[Character Detection] Total entries: ${entries.length}`);
+  api.v1.log(`[Character Detection] Character Category Name setting: "${characterCategoryName}"`);
+  api.v1.log(`[Character Detection] Min text length: ${minTextLength}`);
+  
+  // Debug: log what fields are available on the first entry
+  if (entries.length > 0) {
+    api.v1.log(`[Character Detection] Sample entry fields: ${Object.keys(entries[0]).join(', ')}`);
+  }
+  
+  // Get category information if available
+  let categories = {};
+  let characterCategoryId = null;
+  try {
+    const categoriesData = await api.v1.lorebook.categories();
+    if (categoriesData) {
+      api.v1.log(`[Character Detection] Found ${categoriesData.length} categories`);
+      // Build a map of category ID to category data
+      for (const cat of categoriesData) {
+        if (cat.id) {
+          categories[cat.id] = cat;
+          api.v1.log(`[Character Detection] Category: "${cat.name}" (enabled: ${cat.enabled}, id: ${cat.id})`);
+          // Check if this is the character category (must be enabled)
+          if (characterCategoryName && cat.name && cat.enabled &&
+              cat.name.toLowerCase() === characterCategoryName.toLowerCase()) {
+            characterCategoryId = cat.id;
+            api.v1.log(`[Character Detection] ✓ MATCHED character category! ID: ${characterCategoryId}`);
+          }
+        }
+      }
+    }
+    
+    if (characterCategoryName && !characterCategoryId) {
+      api.v1.log(`[Character Detection] ✗ Character category "${characterCategoryName}" not found or not enabled`);
+    }
+  } catch (error) {
+    api.v1.error("[Character Detection] Error loading categories:", error);
+  }
+  
+  const characterEntries = entries.filter(entry => {
+    const entryName = entry.displayName || entry.id || 'unnamed';
+    
+    // Check both categoryId and category fields (API might use either)
+    const entryCategoryId = entry.categoryId || entry.category;
+    
+    // Log the entry's category ID
+    api.v1.log(`[Character Detection] "${entryName}": categoryId = ${entry.categoryId || 'undefined'}, category = ${entry.category || 'undefined'}, using: ${entryCategoryId || 'undefined'}`);
+    
+    // Must be enabled
+    if (!entry.enabled) {
+      api.v1.log(`[Character Detection] "${entryName}": SKIP - not enabled`);
+      return false;
+    }
+    
+    // Must have text
+    if (!entry.text || entry.text.length < minTextLength) {
+      api.v1.log(`[Character Detection] "${entryName}": SKIP - text too short (${entry.text?.length || 0} < ${minTextLength})`);
+      return false;
+    }
+    
+    // If entry is in the character category, automatically include it
+    if (characterCategoryId && entryCategoryId === characterCategoryId) {
+      api.v1.log(`[Character Detection] "${entryName}": ✓ MATCH - in character category`);
+      return true;
+    } else if (characterCategoryId) {
+      api.v1.log(`[Character Detection] "${entryName}": Category check failed - characterCategoryId="${characterCategoryId}", entryCategoryId="${entryCategoryId}"`);
+    }
+    
+    // Log category mismatch if there's a category ID
+    if (entryCategoryId) {
+      const catName = categories[entryCategoryId]?.name || 'unknown';
+      api.v1.log(`[Character Detection] "${entryName}": in category "${catName}" (${entryCategoryId}), not character category`);
+    }
+    
+    // Otherwise, look for "Type: character" in the entry text (case-insensitive)
+    const entryText = entry.text.toLowerCase();
+    let hasTypeCharacter = entryText.includes('type: character') || 
+                           entryText.includes('type:character');
+    
+    // Alternative detection: look for common character indicators
+    if (!hasTypeCharacter) {
+      // Check for "Characters:" section header (common in lorebooks)
+      if (entryText.includes('characters:')) {
+        hasTypeCharacter = true;
+        api.v1.log(`[Character Detection] "${entryName}": ✓ MATCH - has "Characters:" marker`);
+      }
+    }
+    
+    // Also check if the category header has "Type: character"
+    if (!hasTypeCharacter && entryCategoryId && categories[entryCategoryId]) {
+      const category = categories[entryCategoryId];
+      if (category.settings?.entryHeader) {
+        const headerText = category.settings.entryHeader.toLowerCase();
+        hasTypeCharacter = headerText.includes('type: character') || 
+                          headerText.includes('type:character');
+        if (hasTypeCharacter) {
+          api.v1.log(`[Character Detection] "${entryName}": ✓ MATCH - category header has "Type: character"`);
+        }
+      }
+    }
+    
+    if (!hasTypeCharacter) {
+      api.v1.log(`[Character Detection] "${entryName}": SKIP - no character markers`);
+    }
+    
+    return hasTypeCharacter;
+  });
+  
+  api.v1.log(`[Character Detection] Final result: ${characterEntries.length} characters found`);
+  
+  return characterEntries.map(entry => {
+    // Extract character name from the entry text
+    const lines = entry.text.split('\n');
+    let characterName = entry.displayName || 'Unknown Character';
+    
+    // Method 1: Look for the line right before "Type: character"
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      const lineLower = line.toLowerCase();
+      
+      // Match "type: character" or "type:character" (with or without space)
+      if ((lineLower === 'type: character' || lineLower === 'type:character') && i > 0) {
+        characterName = lines[i - 1].trim();
+        break;
+      }
+    }
+    
+    // Method 2: Look for "Characters:" section and extract name after it
+    if (characterName === entry.displayName || characterName === 'Unknown Character') {
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        const lineLower = line.toLowerCase();
+        
+        if (lineLower === 'characters:') {
+          // Name should be on the next line or in the following lines
+          for (let j = i + 1; j < lines.length; j++) {
+            const nextLine = lines[j].trim();
+            if (nextLine.length > 0) {
+              // Extract name before colon if present (e.g., "Basilisk: description")
+              const colonIndex = nextLine.indexOf(':');
+              if (colonIndex > 0) {
+                characterName = nextLine.substring(0, colonIndex).trim();
+              } else {
+                characterName = nextLine;
+              }
+              break;
+            }
+          }
+          break;
+        }
+      }
+    }
+    
+    // Build the full character text, including category header if available
+    let fullText = entry.text || '';
+    
+    // Check if this entry belongs to a category with a header (check both categoryId and category fields)
+    const entryCategoryId = entry.categoryId || entry.category;
+    if (entryCategoryId && categories[entryCategoryId]) {
+      const category = categories[entryCategoryId];
+      if (category.settings?.entryHeader && category.settings.entryHeader.trim().length > 0) {
+        // Prepend the category header to the character text
+        fullText = category.settings.entryHeader.trim() + '\n\n' + fullText;
+      }
+    }
+    
+    return {
+      id: entry.id,
+      name: characterName,
+      text: fullText
+    };
+  });
+}
+
+/**
+ * Get recent story context for the character to comment on
+ */
+async function getRecentContext() {
+  const sections = await api.v1.document.scan();
+  const contextParagraphs = await api.v1.config.get("contextParagraphs");
+  
+  // Get the last N paragraphs
+  const recentSections = sections.slice(-contextParagraphs);
+  
+  return recentSections
+    .map(s => s.section.text)
+    .join('\n\n');
+}
+
+/**
+ * Find which characters are mentioned in the given text
+ * @param text The text to search
+ * @param characters Array of all available characters
+ * @returns Array of characters that are mentioned in the text
+ */
+function findMentionedCharacters(text, characters) {
+  return characters.filter(character => {
+    const fullName = character.name;
+    const lowerFullName = fullName.toLowerCase();
+    
+    // Check if the full name appears in the text
+    const fullNameRegex = new RegExp('\\b' + lowerFullName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i');
+    let isFound = fullNameRegex.test(text);
+    
+    // If not found and name has multiple words, try just the first name
+    if (!isFound && fullName.includes(' ')) {
+      const firstName = fullName.split(' ')[0];
+      const lowerFirstName = firstName.toLowerCase();
+      const firstNameRegex = new RegExp('\\b' + lowerFirstName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i');
+      isFound = firstNameRegex.test(text);
+    }
+    
+    return isFound;
+  });
+}
+
+/**
+ * Calculate relevance score for a character based on their lorebook keywords appearing in story context
+ * @param character The character object with text field
+ * @param storyContext Recent story text to check against
+ * @returns Relevance score (higher = more invested)
+ */
+function calculateCharacterInvestment(character, storyContext) {
+  // Common words to ignore (articles, prepositions, etc.)
+  const stopWords = new Set([
+    'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+    'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
+    'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
+    'would', 'could', 'should', 'may', 'might', 'must', 'can', 'this',
+    'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they',
+    'what', 'which', 'who', 'when', 'where', 'why', 'how', 'all', 'each',
+    'every', 'both', 'few', 'more', 'most', 'other', 'some', 'such', 'no',
+    'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'type',
+    'character', 'description', 'gender', 'age', 'species', 'appearance'
+  ]);
+  
+  // Extract meaningful words from character's lorebook text (3+ characters, not stop words)
+  const characterText = character.text.toLowerCase();
+  const characterWords = characterText
+    .match(/\b[a-z]{3,}\b/g) || [];
+  
+  const uniqueCharacterWords = new Set(
+    characterWords.filter(word => !stopWords.has(word))
+  );
+  
+  // Check how many of these words appear in the story context
+  const storyLower = storyContext.toLowerCase();
+  let score = 0;
+  
+  for (const word of uniqueCharacterWords) {
+    // Use word boundaries to match whole words
+    const wordRegex = new RegExp('\\b' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g');
+    const matches = (storyLower.match(wordRegex) || []).length;
+    // Each match increases score, but with diminishing returns for repeated words
+    score += Math.min(matches, 3);
+  }
+  
+  return score;
+}
+
+/**
+ * Find the character most invested in recent story events based on lorebook keyword overlap
+ * @param characters Array of all available characters
+ * @param storyContext Recent story text
+ * @returns Character with highest investment score, or null if none
+ */
+function findMostInvestedCharacter(characters, storyContext) {
+  if (characters.length === 0) return null;
+  
+  let highestScore = 0;
+  let mostInvested = null;
+  
+  for (const character of characters) {
+    const score = calculateCharacterInvestment(character, storyContext);
+    if (score > highestScore) {
+      highestScore = score;
+      mostInvested = character;
+    }
+  }
+  
+  return mostInvested;
+}
+
+// ============================================================================
+// Chat Message Management
+// ============================================================================
+
+/**
+ * Get chat messages for a specific character
+ * @param characterName The name of the character
+ * @returns Array of chat messages
+ */
+async function getChatMessages(characterName) {
+  const messages = await api.v1.storyStorage.get(`chat-${characterName}`);
+  return messages || [];
+}
+
+/**
+ * Save a chat message
+ * @param characterName The name of the character
+ * @param type 'user' or 'character'
+ * @param content The message content
+ */
+async function saveChatMessage(characterName, type, content) {
+  const messages = await getChatMessages(characterName);
+  messages.push({
+    id: api.v1.uuid(),
+    type: type,
+    content: content,
+    timestamp: Date.now()
+  });
+  await api.v1.storyStorage.set(`chat-${characterName}`, messages);
+}
+
+/**
+ * Clear chat history for a specific character
+ * @param characterName The name of the character
+ */
+async function clearChatHistory(characterName) {
+  await api.v1.storyStorage.remove(`chat-${characterName}`);
+}
+
+/**
+ * Get recent chat history formatted for AI context
+ * @param characterName The name of the character
+ * @param maxMessages Maximum number of recent messages to include
+ * @returns Formatted chat history string
+ */
+async function getFormattedChatHistory(characterName, maxMessages = 6) {
+  const messages = await getChatMessages(characterName);
+  if (messages.length === 0) return '';
+  
+  const recentMessages = messages.slice(-maxMessages);
+  const formatted = recentMessages.map(msg => {
+    if (msg.type === 'user') {
+      return `User: ${msg.content}`;
+    } else {
+      return `${characterName}: ${msg.content}`;
+    }
+  }).join('\n');
+  
+  return `\n\nPrevious Conversation:\n${formatted}\n`;
+}
+
+/**
+ * Generate a comment from a character's perspective
+ */
+async function generateCharacterComment(characterName, characterInfo, recentContext, isChat = false) {
+  const maxTokens = await api.v1.config.get("maxCommentTokens");
+  const temperature = await api.v1.config.get("commentTemperature");
+  
+  // Adaptive length guidance based on max tokens setting
+  let lengthGuidance;
+  if (maxTokens <= 50) {
+    lengthGuidance = "Keep it to 1-2 sentences.";
+  } else if (maxTokens <= 100) {
+    lengthGuidance = "Keep it to 2-4 sentences.";
+  } else if (maxTokens <= 200) {
+    lengthGuidance = "Provide a short paragraph (4-6 sentences).";
+  } else {
+    lengthGuidance = "Provide a detailed reaction in 1-2 paragraphs.";
+  }
+  
+  // Get chat history if this is a chat response
+  const chatHistory = isChat ? await getFormattedChatHistory(characterName) : '';
+  
+  const systemPrompt = `You are ${characterName}.
+Speak in ${characterName}'s own voice and perspective.
+Reply only with a single quoted line of dialogue, but let it contain a few natural sentences when appropriate.
+Base the reply on ${characterName}'s personality, knowledge, and role in the scene.
+Other characters in the scene are context only. Do not speak as them.
+${lengthGuidance}`;
+
+  const userPrompt = `Current speaker: ${characterName}
+Other named characters are not the speaker.
+
+Character Information:
+${characterInfo}
+
+Recent Story Events:
+${recentContext}${chatHistory}
+
+What is ${characterName}'s in-character reaction to this scene right now?`;
+
+  try {
+    const selectedModel = await api.v1.config.get("generationModel");
+    
+    const response = await api.v1.generate(
+      [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+        { role: "assistant", content: '"' }
+      ],
+      {
+        model: selectedModel,
+        max_tokens: maxTokens,
+        temperature: temperature,
+        stop: ['"', '</think>', '<|assistant|>']
+      },
+      undefined,
+      'background'
+    );
+    
+    if (response.choices && response.choices.length > 0) {
+      let text = response.choices[0].text.trim();
+      
+      // Truncate at the second newline to prevent xialong-v1 from continuing
+      // Find the first newline
+      const firstNewlineIndex = text.indexOf('\n');
+      if (firstNewlineIndex !== -1) {
+        // Find the second newline (past the first one)
+        const secondNewlineIndex = text.indexOf('\n', firstNewlineIndex + 1);
+        if (secondNewlineIndex !== -1) {
+          text = text.substring(0, secondNewlineIndex).trim();
+        }
+      }
+      
+      // Check if text ends with sentence-ending punctuation
+      // If not, backtrack to the last complete sentence
+      if (!/[.!?]$/.test(text)) {
+        // Find the last occurrence of sentence-ending punctuation
+        const lastPeriod = text.lastIndexOf('.');
+        const lastExclamation = text.lastIndexOf('!');
+        const lastQuestion = text.lastIndexOf('?');
+        
+        const lastPunctuation = Math.max(lastPeriod, lastExclamation, lastQuestion);
+        
+        if (lastPunctuation !== -1) {
+          // Cut at the last sentence-ending punctuation (include the punctuation)
+          text = text.substring(0, lastPunctuation + 1).trim();
+        }
+      }
+      
+      text = text.replace(/^"+|"+$/g, '').trim();
+      return text.length > 0 ? `"${text}"` : '"..."';
+    }
+  } catch (error) {
+    api.v1.error("Error generating character comment:", error);
+  }
+  
+  return "...";
+}
+
+// ============================================================================
+// Chat Window Functions
+// ============================================================================
+
+/**
+ * Build chat UI content
+ * @param character The character object
+ * @param onRefresh Callback to refresh the chat
+ * @returns Array of UI parts
+ */
+async function buildChatContent(character, onRefresh) {
+  const messages = await getChatMessages(character.name);
+  
+  // Build message UI parts
+  const messageParts = messages.map(msg => {
+    const messageParts = parseMarkdown(msg.content, { fontSize: '0.9375rem' });
+    
+    return {
+      type: "container",
+      style: {
+        padding: "8px 12px",
+        marginBottom: "8px",
+        borderRadius: "8px",
+        backgroundColor: msg.type === 'user' ? 'bg2' : 'bg3',
+        alignSelf: msg.type === 'user' ? 'flex-end' : 'flex-start',
+        maxWidth: "80%"
+      },
+      content: [
+        {
+          type: "text",
+          text: msg.type === 'user' ? 'You' : character.name,
+          style: { 
+            fontWeight: 'bold', 
+            fontSize: '0.875rem',
+            marginBottom: '4px',
+            opacity: 0.7
+          }
+        },
+        {
+          type: "container",
+          content: messageParts
+        }
+      ]
+    };
+  });
+  
+  // Empty state
+  if (messages.length === 0) {
+    messageParts.push({
+      type: "container",
+      style: {
+        padding: "40px 20px",
+        textAlign: "center",
+        opacity: 0.5
+      },
+      content: [
+        {
+          type: "text",
+          text: `Start a conversation with ${character.name}!`,
+          style: { fontSize: '0.875rem' }
+        }
+      ]
+    });
+  }
+  
+  // Input area
+  const inputArea = {
+    type: "row",
+    style: {
+      gap: "8px",
+      padding: "12px",
+      borderTop: "1px solid",
+      borderColor: "bg3"
+    },
+    content: [
+      {
+        type: "multilineTextInput",
+        id: `chat-input-${character.name}`,
+        placeholder: `Message ${character.name}...`,
+        storageKey: `temp:chat-input-${character.name}`,
+        style: { flex: "1", minHeight: "60px", margin: 0 },
+        onSubmit: async (value) => {
+          if (!value.trim()) return;
+          await api.v1.tempStorage.set(`chat-input-${character.name}`, "");
+          await handleChatMessage(character, value);
+          await onRefresh();
+        }
+      },
+      {
+        type: "button",
+        text: "Send",
+        iconId: "send",
+        style: { margin: 0 },
+        callback: async () => {
+          const message = await api.v1.tempStorage.get(`chat-input-${character.name}`);
+          if (message && message.trim()) {
+            await api.v1.tempStorage.set(`chat-input-${character.name}`, "");
+            await handleChatMessage(character, message);
+            await onRefresh();
+          }
+        }
+      }
+    ]
+  };
+  
+  return [
+    {
+      type: "container",
+      style: {
+        height: "100%",
+        display: "flex",
+        flexDirection: "column"
+      },
+      content: [
+        {
+          type: "container",
+          style: {
+            flex: "1",
+            overflowY: "auto",
+            display: "flex",
+            flexDirection: "column",
+            padding: "12px"
+          },
+          content: messageParts
+        },
+        inputArea
+      ]
+    }
+  ];
+}
+
+/**
+ * Handle a user message in chat
+ * @param character The character object
+ * @param messageText The user's message
+ */
+async function handleChatMessage(character, messageText) {
+  if (!messageText.trim() || isGeneratingComment) return;
+  
+  setGenerationFlag(true);
+  
+  try {
+    // Save user message
+    await saveChatMessage(character.name, 'user', messageText.trim());
+    
+    // Get recent context
+    const recentContext = await getRecentContext();
+    
+    // Generate character response
+    const response = await generateCharacterComment(
+      character.name,
+      character.text,
+      recentContext,
+      true // isChat = true
+    );
+    
+    // Save character response
+    await saveChatMessage(character.name, 'character', response);
+    
+  } catch (error) {
+    api.v1.error("Error in chat:", error);
+  } finally {
+    setGenerationFlag(false);
+  }
+}
+
+/**
+ * Open chat window for a character
+ * @param character The character object
+ */
+async function openChatWindow(character) {
+  if (chatWindowOpen) return; // Prevent multiple windows
+  
+  const refreshChat = async () => {
+    if (!chatWindowOpen) return;
+    const content = await buildChatContent(character, refreshChat);
+    await chatHandle.update({ content });
+  };
+  
+  const initialContent = await buildChatContent(character, refreshChat);
+  
+  const chatHandle = await api.v1.ui.window.open({
+    id: `character-chat-${character.name}`,
+    title: `Chat with ${character.name}`,
+    defaultWidth: 450,
+    defaultHeight: 600,
+    minWidth: 350,
+    minHeight: 400,
+    resizable: true,
+    content: initialContent
+  });
+  
+  chatWindowOpen = true;
+  
+  // When closed, clean up
+  chatHandle.closed.then(() => {
+    chatWindowOpen = false;
+  });
+}
+
+/**
+ * Main function to generate and display a character comment
+ * @param skipChanceCheck If true, always generate (used for manual clicks)
+ * @param forceCharacter Optional character object to force selection of specific character
+ */
+async function generateAndShowComment(skipChanceCheck = false, forceCharacter = null) {
+  // Prevent overlapping comment generations
+  if (isGeneratingComment) {
+    return;
+  }
+  
+  setGenerationFlag(true);
+  
+  try {
+    // Get config values
+    const commentChance = await api.v1.config.get("commentChance");
+    const autoShow = await api.v1.config.get("autoShow");
+    const maxCharacterButtons = await api.v1.config.get("maxCharacterButtons");
+    
+    // Check if we should generate a comment based on chance
+    // Skip this check if the user manually clicked to regenerate
+    if (!skipChanceCheck && !api.v1.random.bool(commentChance)) {
+      // Don't hide the bot, just skip generation this time
+      return;
+    }
+    
+    // Get available character entries
+    let characters;
+    try {
+      characters = await getCharacterEntries();
+    } catch (error) {
+      api.v1.error("Error getting character entries:", error);
+      await api.v1.commentBot.update({
+        visible: false,
+        state: null
+      });
+      return;
+    }
+    
+    if (characters.length === 0) {
+      await api.v1.commentBot.update({
+        visible: false,
+        state: null
+      });
+      return;
+    }
+    
+    // Get recent story context
+    let recentContext;
+    try {
+      recentContext = await getRecentContext();
+    } catch (error) {
+      api.v1.error("Error getting recent context:", error);
+      await api.v1.commentBot.update({
+        visible: false,
+        state: null
+      });
+      return;
+    }
+    
+    if (!recentContext || recentContext.length === 0) {
+      await api.v1.commentBot.update({
+        visible: false,
+        state: null
+      });
+      return;
+    }
+    
+    // Select character (forced or contextual/random)
+    let selectedCharacter;
+    let thinkingRatio = null; // For displaying investment comparison
+    
+    if (forceCharacter) {
+      selectedCharacter = forceCharacter;
+    } else {
+      const soloSpeakerName = await getSoloSpeakerName();
+      if (soloSpeakerName) {
+        const lockedCharacter = characters.find(character => character.name.toLowerCase() === soloSpeakerName.toLowerCase());
+        if (lockedCharacter) {
+          selectedCharacter = lockedCharacter;
+        }
+      }
+
+      if (!selectedCharacter) {
+        const investmentBasedSelection = await api.v1.config.get("investmentBasedSelection");
+      
+        // Find characters mentioned in recent context
+        const mentionedCharacters = findMentionedCharacters(recentContext, characters);
+      
+      // Build selection pool
+      let selectionPool = [];
+      
+      if (mentionedCharacters.length > 0) {
+        // Add mentioned characters to pool
+        selectionPool = [...mentionedCharacters];
+      } else {
+        // No mentions, use all characters
+        selectionPool = [...characters];
+      }
+      
+      // If investment-based selection is enabled, calculate scores and double most invested's chance
+      let investmentScores = new Map(); // character.id -> score
+      if (investmentBasedSelection) {
+        // Calculate scores for all characters
+        for (const character of characters) {
+          const score = calculateCharacterInvestment(character, recentContext);
+          investmentScores.set(character.id, score);
+        }
+        
+        // Find most invested character
+        const mostInvested = findMostInvestedCharacter(characters, recentContext);
+        if (mostInvested) {
+          // Add the most invested character again to double their chance
+          selectionPool.push(mostInvested);
+        }
+      }
+      
+      // Select from pool
+      selectedCharacter = selectionPool[api.v1.random.int(0, selectionPool.length - 1)];
+      
+        // Calculate thinking ratio if investment-based selection is enabled
+        if (investmentBasedSelection && investmentScores.size > 0) {
+          const selectedScore = investmentScores.get(selectedCharacter.id) || 0;
+        
+          // Find highest and second-highest scores
+          const sortedScores = Array.from(investmentScores.values()).sort((a, b) => b - a);
+          const highestScore = sortedScores[0] || 0;
+          const secondHighestScore = sortedScores[1] || 0;
+        
+          // Compare selected character's score to the appropriate baseline
+          let comparisonScore;
+          if (selectedScore === highestScore && secondHighestScore > 0) {
+            // Selected has highest score, compare to second-highest
+            comparisonScore = secondHighestScore;
+          } else if (highestScore > 0) {
+            // Selected doesn't have highest, compare to highest
+            comparisonScore = highestScore;
+          }
+        
+          // Calculate ratio (avoid division by zero)
+          if (comparisonScore > 0) {
+            thinkingRatio = Math.round((selectedScore / comparisonScore) * 100);
+          } else if (selectedScore > 0) {
+            thinkingRatio = 100; // Only character with any score
+          }
+        }
+      }
+    }
+    
+    // Get avatar: try avatar lorebook first, then fall back to default setting
+    let characterAvatarImage = await getAvatarFromLorebook(selectedCharacter.name);
+    if (!characterAvatarImage) {
+      try {
+        characterAvatarImage = await generateCharacterAvatar(selectedCharacter);
+      } catch (error) {
+        api.v1.error("Could not generate character avatar:", error);
+        await api.v1.ui.toast(`Could not generate an avatar for ${selectedCharacter.name}; using the default.`, { type: "warning" });
+      }
+    }
+    const hasCharacterSpecificAvatar = !!characterAvatarImage;
+    const soloSpeakerName = await getSoloSpeakerName();
+    const isSoloSpeaker = !!soloSpeakerName && soloSpeakerName.toLowerCase() === selectedCharacter.name.toLowerCase();
+    let imageData = characterAvatarImage;
+    if (!imageData) {
+      imageData = await getDefaultAvatarImage();
+    }
+    
+    // Show thinking state
+    await api.v1.commentBot.update({
+      name: "", // Empty - show name in content for consistency
+      state: "thinking",
+      visible: autoShow,
+      image: imageData,
+      content: [
+        {
+          type: "text",
+          text: selectedCharacter.name,
+          style: { fontWeight: 'bold', fontSize: '16px', marginBottom: '4px' }
+        },
+        {
+          type: "text",
+          text: "*thinking about recent events...*",
+          style: { fontStyle: 'italic', opacity: 0.7 }
+        }
+      ],
+      callback: async () => {
+        await generateAndShowComment(true); // Skip chance check on manual click
+      }
+    });
+    
+    // Generate the comment
+    const comment = await generateCharacterComment(
+      selectedCharacter.name,
+      selectedCharacter.text,
+      recentContext
+    );
+    
+    // Check if character changed - if so, clear old chat history
+    if (currentChatCharacter && currentChatCharacter !== selectedCharacter.name) {
+      await clearChatHistory(currentChatCharacter);
+    }
+    currentChatCharacter = selectedCharacter.name;
+    
+    // Save the comment to chat history so it's there when chat opens
+    await saveChatMessage(selectedCharacter.name, 'character', comment);
+    
+    // Build character selection buttons
+    let buttonCharacters;
+    if (characters.length <= maxCharacterButtons) {
+      buttonCharacters = characters;
+    } else {
+      // Proper random selection using Fisher-Yates shuffle
+      const shuffled = [...characters]; // Copy array
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = api.v1.random.int(0, i);
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      buttonCharacters = shuffled.slice(0, maxCharacterButtons);
+    }
+    
+    const characterButtons = buttonCharacters.map(char => ({
+      type: "button",
+      text: char.name,
+      style: { fontSize: '11px', padding: '4px 8px' },
+      callback: async () => {
+        await generateAndShowComment(true, char); // Force this character
+      }
+    }));
+    
+    // Display the comment
+    const commentParts = parseMarkdown(comment, { fontSize: '14px' });
+    
+    // Build character name with thinking ratio if available
+    const characterDisplayName = thinkingRatio !== null 
+      ? `${selectedCharacter.name} (Thinking Ratio: ${thinkingRatio}%)`
+      : selectedCharacter.name;
+    
+    await api.v1.commentBot.update({
+      name: "", // Empty - we'll show name in content instead
+      state: "speaking",
+      visible: autoShow,
+      image: imageData,
+      content: [
+        {
+          type: "container",
+          style: {
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginTop: '-8px',    // Negative margin to pull up
+            marginBottom: '4px'   // Reduced from 8px
+          },
+          content: [
+            {
+              type: "text",
+              text: characterDisplayName,
+              style: {
+                fontWeight: 'bold',
+                fontSize: '16px'
+              }
+            },
+            {
+              type: "button",
+              text: "✕",
+              style: { 
+                fontSize: '16px', 
+                padding: '2px 8px',
+                minWidth: '24px',
+                opacity: 0.7
+              },
+              callback: async () => {
+                await api.v1.commentBot.update({
+                  visible: false
+                });
+              }
+            }
+          ]
+        },
+        {
+          type: "container",
+          style: { 
+            marginBottom: '4px'  // Reduced from 8px
+          },
+          content: commentParts
+        },
+        {
+          type: "container",
+          style: {
+            display: 'flex',
+            flexWrap: 'wrap',
+            gap: '8px',
+            marginBottom: '8px'
+          },
+          content: [
+            {
+              type: "button",
+              text: "Chat",
+              iconId: "message-circle",
+              style: { fontSize: '12px', marginBottom: '0' },
+              callback: async () => {
+                await openChatWindow(selectedCharacter);
+              }
+            },
+            ...(!hasCharacterSpecificAvatar ? [{
+              type: "button",
+              text: "Set Avatar",
+              iconId: "image-plus",
+              style: { fontSize: '12px', marginBottom: '0' },
+              callback: async () => {
+                const uploadedImage = await promptForCharacterAvatarUpload(selectedCharacter.name);
+                if (uploadedImage) {
+                  await api.v1.commentBot.update({
+                    image: uploadedImage
+                  });
+                }
+              }
+            }] : [{
+              type: "button",
+              text: "Clear Avatar",
+              iconId: "image-off",
+              style: { fontSize: '12px', marginBottom: '0' },
+              callback: async () => {
+                const wasCleared = await clearCharacterAvatarFromLorebook(selectedCharacter.name);
+                if (wasCleared) {
+                  await api.v1.commentBot.update({
+                    image: await getDefaultAvatarImage()
+                  });
+                }
+              }
+            }]),
+            {
+              type: "button",
+              text: isSoloSpeaker ? "Random Speakers" : "Only This Character",
+              iconId: isSoloSpeaker ? "shuffle" : "user-check",
+              style: { fontSize: '12px', marginBottom: '0' },
+              callback: async () => {
+                if (isSoloSpeaker) {
+                  await clearSoloSpeakerName();
+                } else {
+                  await setSoloSpeakerName(selectedCharacter.name);
+                }
+              }
+            }
+          ]
+        },
+        {
+          type: "container",
+          style: { 
+            display: 'flex', 
+            flexWrap: 'wrap', 
+            gap: '4px',
+            maxHeight: '120px',
+            overflowY: 'auto'
+          },
+          content: characterButtons
+        }
+      ],
+      callback: async () => {
+        await generateAndShowComment(true); // Skip chance check on manual click
+      }
+    });
+    
+  } catch (error) {
+    api.v1.error("Error in character commentator:", error);
+    
+    // Reset bot on error
+    await api.v1.commentBot.update({
+      visible: false,
+      state: null
+    });
+    
+  } finally {
+    setGenerationFlag(false);
+  }
+}
+
+// ============================================================================
+// Hook Registration
+// ============================================================================
+
+/**
+ * Hook: After generation ends, trigger character commentary
+ */
+api.v1.hooks.register("onGenerationEnd", async (params) => {
+  // Don't comment on inline generations
+  if (params.inlineGeneration) {
+    return;
+  }
+  
+  // Generate and show the character comment
+  await generateAndShowComment();
+});
+
+/**
+ * Hook: When scripts load, set up initial UI
+ */
+api.v1.hooks.register("onScriptsLoaded", async () => {
+  // Register a toolbar button to manually trigger commentary
+  await api.v1.ui.register([
+    {
+      type: "toolbarButton",
+      id: "character-commentator-trigger",
+      text: "Character Comment",
+      iconId: "message-circle",
+      callback: async () => {
+        await generateAndShowComment(true); // Skip chance check for manual trigger
+      }
+    }
+  ]);
+});
+
+// ============================================================================
+// Initialization
+// ============================================================================
+
+api.v1.log("Character Commentator extension initialized");
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
