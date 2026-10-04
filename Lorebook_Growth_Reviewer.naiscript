@@ -1,0 +1,1926 @@
+/*---
+compatibilityVersion: naiscript-1.0
+id: 6d668d51-3e17-4ca7-a53d-64fc26fb8c61
+name: Lorebook Growth Reviewer
+createdAt: 1778000400000
+updatedAt: 1778000400000
+version: 1.7.0
+author: dmssi
+description: "After enough new words are added, reviews lorebook entries for newly established facts and lets you accept or decline proposed updates."
+memoryLimit: 96
+config: []
+---*/
+
+const TOOLBAR_BUTTON_ID = "lorebook-growth-reviewer-toolbar";
+const MODEL = "glm-4-6";
+const DEFAULT_CHECK_INTERVAL_WORDS = 2000;
+const MIN_CHECK_INTERVAL_WORDS = 100;
+const MAX_LOREBOOK_ENTRY_WORDS = 5000;
+const MAX_LOREBOOK_ENTRY_CHARS = 2000;
+const MAX_COMPACTION_INPUT_CHARS = 12000;
+const RECENT_STORY_PADDING_WORDS = 300;
+const MAX_RECENT_STORY_WORDS = 5000;
+const MAX_REVIEW_OUTPUT_TOKENS = 220;
+const MAX_COMPACTION_OUTPUT_TOKENS = 500;
+const TARGET_FACTS_PER_RUN = 15;
+const MAX_FACTS_PER_ENTRY = 3;
+const STORAGE_INTERVAL_KEY = "lorebook-growth-reviewer-interval";
+const STORAGE_STATE_KEY = "lorebook-growth-reviewer-state";
+const STORAGE_OVERRIDES_KEY = "lorebook-growth-reviewer-overrides";
+const STORAGE_AUTO_ACCEPT_KEY = "lorebook-growth-reviewer-auto-accept";
+const ALIAS_CONNECTOR_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "at",
+  "da",
+  "de",
+  "du",
+  "for",
+  "in",
+  "la",
+  "le",
+  "of",
+  "on",
+  "or",
+  "the",
+  "to",
+  "van",
+  "von",
+]);
+
+type ReviewOverrideMode = "skip" | "force";
+type ReviewOverrides = Record<string, ReviewOverrideMode | undefined>;
+
+type ReviewerState = {
+  lastKnownWordCount: number;
+  lastAutoCheckWordCount: number;
+  reviewCursorEntryId?: string;
+  pendingSceneBreak?: boolean;
+  pendingSceneBreakCharCount?: number;
+  sectionSummaries?: StorySectionSummary[];
+};
+
+type LorebookProposalItem = {
+  fact: string;
+  addition: string;
+};
+
+type LorebookReviewResult = {
+  hasUpdate: boolean;
+  proposalItems: LorebookProposalItem[];
+  rationale?: string;
+};
+
+type LorebookSuggestion = {
+  entryId: string;
+  displayName: string;
+  currentText: string;
+  proposalItems: LorebookProposalItem[];
+  rationale?: string;
+  mode?: "additions" | "compaction";
+};
+
+type LorebookEntrySummary = {
+  id: string;
+  displayName: string;
+  enabled: boolean;
+  keys?: string[];
+};
+
+type LorebookListEntry = LorebookEntrySummary & {
+  text: string;
+};
+
+type StorySectionSummary = {
+  sectionId: number;
+  textLength: number;
+  textSampleStart: string;
+  textSampleEnd: string;
+  wordCount: number;
+};
+
+type StorySnapshot = {
+  wordCount: number;
+  charCount: number;
+  sectionSummaries: StorySectionSummary[];
+};
+
+type GenerationMessage = {
+  role: "system" | "user" | "assistant";
+  content: string;
+};
+
+let isReviewRunning = false;
+type ReviewProgress = {
+  phase: "preparing" | "reviewing" | "waiting";
+  completedEntries: number;
+  totalEntries: number;
+  waitUntil?: number;
+  waitReason?: string;
+};
+
+let reviewProgress: ReviewProgress | undefined;
+
+function getReviewProgressText(): string {
+  if (!isReviewRunning || !reviewProgress) {
+    return "No review is currently in progress.";
+  }
+
+  const progress = `${reviewProgress.completedEntries} of ${reviewProgress.totalEntries} entries done`;
+  if (reviewProgress.phase === "waiting") {
+    if (typeof reviewProgress.waitUntil === "number") {
+      const seconds = Math.max(0, Math.ceil((reviewProgress.waitUntil - Date.now()) / 1000));
+      return `Review in progress: ${progress}. Waiting for token budget (${reviewProgress.waitReason ?? "generation"}); next attempt in about ${seconds}s.`;
+    }
+    return `Review in progress: ${progress}. Waiting for token budget; it will try again when budget is available.`;
+  }
+
+  return reviewProgress.phase === "preparing"
+    ? `Review in progress: preparing the review (${progress}).`
+    : `Review in progress: ${progress}.`;
+}
+
+function countWords(text: string): number {
+  const matches = text.match(/\S+/gu);
+  return matches ? matches.length : 0;
+}
+
+function takeLastWords(text: string, maxWords: number): string {
+  if (maxWords <= 0) {
+    return "";
+  }
+
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  const wordMatches = Array.from(trimmed.matchAll(/\S+/gu));
+  if (wordMatches.length <= maxWords) {
+    return trimmed;
+  }
+
+  const startMatch = wordMatches[wordMatches.length - maxWords];
+  const startIndex = startMatch.index ?? 0;
+  return trimmed.slice(startIndex).trim();
+}
+
+function buildCompactionSourceText(text: string, maxChars: number): string {
+  const normalized = text.replace(/\r\n/gu, "\n").trim();
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  const rawLines = normalized.split("\n");
+  const importantLines: string[] = [];
+  let importantChars = 0;
+
+  for (const rawLine of rawLines) {
+    const line = rawLine.trimEnd();
+    if (!line.trim()) {
+      continue;
+    }
+
+    importantLines.push(line);
+    importantChars += line.length + 1;
+
+    if (importantLines.length >= 14 || importantChars >= Math.floor(maxChars * 0.45)) {
+      break;
+    }
+  }
+
+  const remainingBudget = Math.max(0, maxChars - importantLines.join("\n").length - 32);
+  const trailingText = remainingBudget > 0 ? takeLastWords(normalized, Math.max(1, Math.floor(remainingBudget / 6))) : "";
+  const uniqueImportant = importantLines.join("\n").trim();
+
+  if (!trailingText) {
+    return uniqueImportant;
+  }
+
+  if (trailingText.includes(uniqueImportant)) {
+    return trailingText.slice(-maxChars).trim();
+  }
+
+  return `${uniqueImportant}\n\n[Recent retained details]\n${trailingText}`.slice(0, maxChars).trim();
+}
+
+function normalizeText(text: string | undefined): string {
+  return typeof text === "string" ? text.trim() : "";
+}
+
+function escapeFence(text: string): string {
+  return text.replace(/```/gu, "'''");
+}
+
+function normalizeForComparison(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/\s+/gu, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, "")
+    .trim();
+}
+
+function splitIntoComparableChunks(text: string): string[] {
+  return text
+    .split(/\n+/gu)
+    .flatMap((line) => line.split(/(?<=[.!?])\s+/gu))
+    .map((chunk) => normalizeForComparison(chunk))
+    .filter((chunk) => chunk.length >= 20);
+}
+
+function chunkSimilarity(left: string, right: string): number {
+  const leftWords = new Set(left.split(" ").filter(Boolean));
+  const rightWords = new Set(right.split(" ").filter(Boolean));
+  if (leftWords.size === 0 || rightWords.size === 0) {
+    return 0;
+  }
+
+  let overlap = 0;
+  for (const word of leftWords) {
+    if (rightWords.has(word)) {
+      overlap += 1;
+    }
+  }
+
+  return overlap / Math.max(leftWords.size, rightWords.size);
+}
+
+function isRepeatedAddition(currentText: string, proposedAddition: string): boolean {
+  const normalizedCurrent = normalizeForComparison(currentText);
+  const normalizedAddition = normalizeForComparison(proposedAddition);
+
+  if (!normalizedAddition) {
+    return true;
+  }
+
+  if (normalizedCurrent.includes(normalizedAddition)) {
+    return true;
+  }
+
+  if (normalizedAddition.includes(normalizedCurrent) && normalizedCurrent.length >= 40) {
+    return true;
+  }
+
+  const currentChunks = splitIntoComparableChunks(currentText);
+  const additionChunks = splitIntoComparableChunks(proposedAddition);
+  if (additionChunks.length === 0) {
+    return normalizedCurrent.includes(normalizedAddition);
+  }
+
+  return additionChunks.every((chunk) =>
+    normalizedCurrent.includes(chunk) ||
+    currentChunks.some((currentChunk) =>
+      currentChunk === chunk ||
+      currentChunk.includes(chunk) ||
+      chunk.includes(currentChunk) ||
+      chunkSimilarity(currentChunk, chunk) >= 0.9
+    )
+  );
+}
+
+function normalizeProposalItems(items: unknown): LorebookProposalItem[] {
+  if (!Array.isArray(items)) {
+    return [];
+  }
+
+  return items
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return undefined;
+      }
+
+      const fact = normalizeText((item as { fact?: string }).fact);
+      const addition = normalizeText((item as { addition?: string }).addition);
+      if (!fact || !addition) {
+        return undefined;
+      }
+
+      return { fact, addition };
+    })
+    .filter((item): item is LorebookProposalItem => item !== undefined)
+    .slice(0, 5);
+}
+
+function getNonEmptyLines(text: string): string[] {
+  return text
+    .replace(/\r\n/gu, "\n")
+    .trim()
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+}
+
+function expectedLorebookNameLine(entry: LorebookListEntry): string {
+  const normalized = entry.text.replace(/\r\n/gu, "\n");
+  const nonEmptyLines = normalized.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+
+  if (nonEmptyLines.length >= 2 && nonEmptyLines[0] === "----") {
+    return nonEmptyLines[1];
+  }
+
+  return entry.displayName;
+}
+
+function getSubjectReferenceNames(entry: LorebookListEntry): string[] {
+  const names = new Set<string>();
+  const expectedName = expectedLorebookNameLine(entry).trim();
+  const displayName = (entry.displayName ?? "").trim();
+  const aliasesLine = entry.text
+    .replace(/\r\n/gu, "\n")
+    .split("\n")
+    .find((line) => /^\s*aliases\s*:/iu.test(line));
+
+  if (expectedName) {
+    names.add(expectedName);
+    for (const part of expectedName.split(/\s+/gu)) {
+      if (part.length >= 3) {
+        names.add(part);
+      }
+    }
+  }
+
+  if (displayName) {
+    names.add(displayName);
+    for (const part of displayName.split(/\s+/gu)) {
+      if (part.length >= 3) {
+        names.add(part);
+      }
+    }
+  }
+
+  if (aliasesLine) {
+    const aliasesText = aliasesLine.replace(/^\s*aliases\s*:\s*/iu, "");
+    for (const alias of aliasesText.split(",")) {
+      const normalizedAlias = alias.trim();
+      if (!normalizedAlias) {
+        continue;
+      }
+
+      names.add(normalizedAlias);
+      for (const part of normalizedAlias.split(/\s+/gu)) {
+        if (part.length >= 3 && !ALIAS_CONNECTOR_WORDS.has(part.toLocaleLowerCase())) {
+          names.add(part);
+        }
+      }
+    }
+  }
+
+  for (const key of entry.keys ?? []) {
+    const normalizedKey = key.trim();
+    if (normalizedKey) {
+      names.add(normalizedKey);
+    }
+  }
+
+  return Array.from(names);
+}
+
+function escapeRegularExpression(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+function isLorebookEntryMentioned(entry: LorebookListEntry, reviewText: string): boolean {
+  const normalizedReviewText = reviewText.trim();
+  if (!normalizedReviewText) {
+    return false;
+  }
+
+  return getSubjectReferenceNames(entry).some((name) => {
+    const normalizedName = name.trim();
+    if (!normalizedName) {
+      return false;
+    }
+
+    return new RegExp(`(?:^|[^\\p{L}\\p{N}_])${escapeRegularExpression(normalizedName)}(?![\\p{L}\\p{N}_])`, "iu").test(
+      normalizedReviewText,
+    );
+  });
+}
+
+function isSubjectRelevantAddition(entry: LorebookListEntry, fact: string, addition: string): boolean {
+  const normalizedAddition = addition.trim();
+  if (!normalizedAddition) {
+    return false;
+  }
+
+  const allowedPronounStarts = ["He ", "She ", "They ", "It ", "His ", "Her ", "Their ", "Its "];
+  if (allowedPronounStarts.some((prefix) => normalizedAddition.startsWith(prefix))) {
+    return true;
+  }
+
+  const subjectNames = getSubjectReferenceNames(entry);
+  if (subjectNames.some((name) => normalizedAddition.startsWith(`${name} `) || normalizedAddition.includes(name))) {
+    return true;
+  }
+
+  const normalizedFact = fact.trim();
+  if (subjectNames.some((name) => normalizedFact.startsWith(name) || normalizedFact.includes(name))) {
+    return true;
+  }
+
+  return false;
+}
+
+function validateCompactedLorebook(text: string, expectedNameLine: string): string {
+  const lines = getNonEmptyLines(text);
+  if (
+    lines.length < 3
+    || lines[0] !== "----"
+    || lines[1].trim() !== expectedNameLine.trim()
+    || !normalizeForComparison(lines[2]).startsWith("type character")
+  ) {
+    return "";
+  }
+
+  return lines.join("\n");
+}
+
+async function getConfiguredIntervalWords(): Promise<number> {
+  const configuredValue = await api.v1.config.get("check_interval_words");
+  const storedValue = await api.v1.storage.get(STORAGE_INTERVAL_KEY);
+  const rawValue = typeof configuredValue === "number" ? configuredValue : storedValue;
+
+  if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+    return Math.max(MIN_CHECK_INTERVAL_WORDS, Math.floor(rawValue));
+  }
+
+  return DEFAULT_CHECK_INTERVAL_WORDS;
+}
+
+async function setConfiguredIntervalWords(value: number): Promise<number> {
+  const normalizedValue = Math.max(MIN_CHECK_INTERVAL_WORDS, Math.floor(value));
+  await api.v1.storage.set(STORAGE_INTERVAL_KEY, normalizedValue);
+  return normalizedValue;
+}
+
+async function loadReviewOverrides(): Promise<ReviewOverrides> {
+  const storedOverrides = await api.v1.storyStorage.get(STORAGE_OVERRIDES_KEY) as ReviewOverrides | undefined;
+  if (!storedOverrides || typeof storedOverrides !== "object") {
+    return {};
+  }
+
+  const normalizedOverrides: ReviewOverrides = {};
+  for (const [entryId, mode] of Object.entries(storedOverrides)) {
+    if (mode === "skip" || mode === "force") {
+      normalizedOverrides[entryId] = mode;
+    }
+  }
+
+  return normalizedOverrides;
+}
+
+async function saveReviewOverrides(overrides: ReviewOverrides): Promise<void> {
+  await api.v1.storyStorage.set(STORAGE_OVERRIDES_KEY, overrides);
+}
+
+async function loadAutoAcceptEnabled(): Promise<boolean> {
+  const storedValue = await api.v1.storyStorage.get(STORAGE_AUTO_ACCEPT_KEY);
+  return storedValue === true;
+}
+
+async function saveAutoAcceptEnabled(enabled: boolean): Promise<void> {
+  await api.v1.storyStorage.set(STORAGE_AUTO_ACCEPT_KEY, enabled);
+}
+
+function overrideLabel(mode: ReviewOverrideMode | undefined): string {
+  if (mode === "skip") {
+    return "Skip";
+  }
+  if (mode === "force") {
+    return "Force";
+  }
+  return "Default";
+}
+
+function nextOverrideMode(mode: ReviewOverrideMode | undefined): ReviewOverrideMode | undefined {
+  if (mode === undefined) {
+    return "skip";
+  }
+  if (mode === "skip") {
+    return "force";
+  }
+  return undefined;
+}
+
+async function getLorebookEntries(): Promise<LorebookEntrySummary[]> {
+  const entries = await api.v1.lorebook.entries();
+  return entries.map((entry) => ({
+    id: entry.id,
+    displayName: entry.displayName ?? "Untitled Entry",
+    enabled: entry.enabled !== false,
+    keys: Array.isArray(entry.keys) ? entry.keys.filter((key) => typeof key === "string") : [],
+  }));
+}
+
+async function getLorebookEntryById(entryId: string): Promise<LorebookListEntry | undefined> {
+  const entry = await api.v1.lorebook.entry(entryId);
+  if (!entry) {
+    return undefined;
+  }
+
+  return {
+    id: entry.id,
+    displayName: entry.displayName ?? "Untitled Entry",
+    text: normalizeText(entry.text),
+    enabled: entry.enabled !== false,
+    keys: Array.isArray(entry.keys) ? entry.keys.filter((key) => typeof key === "string") : [],
+  };
+}
+
+async function getStorySections(): Promise<Array<{ sectionId: number; text: string }>> {
+  const sections = await api.v1.document.scan();
+  return sections.map((entry) => ({
+    sectionId: entry.sectionId,
+    text: entry.section.text,
+  }));
+}
+
+function buildSectionSummary(sectionId: number, text: string): StorySectionSummary {
+  return {
+    sectionId,
+    textLength: text.length,
+    textSampleStart: text.slice(0, 64),
+    textSampleEnd: text.slice(-64),
+    wordCount: countWords(text),
+  };
+}
+
+function sectionSummaryMatches(
+  previousSummary: StorySectionSummary | undefined,
+  sectionId: number,
+  text: string,
+): boolean {
+  if (!previousSummary) {
+    return false;
+  }
+
+  return previousSummary.sectionId === sectionId
+    && previousSummary.textLength === text.length
+    && previousSummary.textSampleStart === text.slice(0, 64)
+    && previousSummary.textSampleEnd === text.slice(-64);
+}
+
+async function getStorySnapshot(previousSummaries?: StorySectionSummary[]): Promise<StorySnapshot> {
+  const sections = await getStorySections();
+  let wordCount = 0;
+  let charCount = 0;
+  const sectionSummaries: StorySectionSummary[] = [];
+
+  for (let index = 0; index < sections.length; index += 1) {
+    const text = sections[index].text;
+    const previousSummary = previousSummaries?.[index];
+    const summary = sectionSummaryMatches(previousSummary, sections[index].sectionId, text)
+      ? previousSummary
+      : buildSectionSummary(sections[index].sectionId, text);
+
+    wordCount += summary.wordCount;
+    charCount += text.length;
+    if (index > 0) {
+      charCount += 2;
+    }
+    sectionSummaries.push(summary);
+  }
+
+  return {
+    wordCount,
+    charCount,
+    sectionSummaries,
+  };
+}
+
+async function getRecentStoryExcerpt(targetWords: number): Promise<string> {
+  const sections = await getStorySections();
+  const collected: string[] = [];
+  let collectedWords = 0;
+  const cappedTarget = Math.min(MAX_RECENT_STORY_WORDS, Math.max(targetWords, DEFAULT_CHECK_INTERVAL_WORDS) + RECENT_STORY_PADDING_WORDS);
+
+  for (let index = sections.length - 1; index >= 0; index -= 1) {
+    const text = sections[index].text.trim();
+    if (!text) {
+      continue;
+    }
+
+    const sectionWordCount = countWords(text);
+    const remainingWords = cappedTarget - collectedWords;
+
+    if (remainingWords <= 0) {
+      break;
+    }
+
+    if (sectionWordCount <= remainingWords) {
+      collected.unshift(text);
+      collectedWords += sectionWordCount;
+    } else {
+      const trimmedTail = takeLastWords(text, remainingWords);
+      if (trimmedTail) {
+        collected.unshift(trimmedTail);
+        collectedWords += countWords(trimmedTail);
+      }
+      break;
+    }
+
+    if (collectedWords >= cappedTarget) {
+      break;
+    }
+  }
+
+  return collected.join("\n\n").trim();
+}
+
+function splitStoryIntoReviewChunks(sections: Array<{ sectionId: number; text: string }>): string[] {
+  const chunks: string[] = [];
+  let current = "";
+  let currentWords = 0;
+
+  for (const section of sections) {
+    const words = section.text.trim().split(/\s+/u).filter(Boolean);
+    for (let offset = 0; offset < words.length; offset += MAX_RECENT_STORY_WORDS) {
+      const part = words.slice(offset, offset + MAX_RECENT_STORY_WORDS).join(" ");
+      const partWords = countWords(part);
+      if (current && currentWords + partWords > MAX_RECENT_STORY_WORDS) {
+        chunks.push(current);
+        current = "";
+        currentWords = 0;
+      }
+      current = current ? `${current}\n\n${part}` : part;
+      currentWords += partWords;
+    }
+  }
+
+  if (current) {
+    chunks.push(current);
+  }
+  return chunks;
+}
+
+async function readStoredReviewerState(): Promise<Partial<ReviewerState> | undefined> {
+  return api.v1.storyStorage.get(STORAGE_STATE_KEY) as Promise<Partial<ReviewerState> | undefined>;
+}
+
+function createInitialReviewerState(wordCount: number): ReviewerState {
+  return {
+    lastKnownWordCount: wordCount,
+    lastAutoCheckWordCount: wordCount,
+    reviewCursorEntryId: undefined,
+    pendingSceneBreak: false,
+    pendingSceneBreakCharCount: undefined,
+    sectionSummaries: undefined,
+  };
+}
+
+function normalizeReviewerState(
+  storedState: Partial<ReviewerState> | undefined,
+  initialWordCount: number,
+): ReviewerState {
+  if (
+    storedState &&
+    typeof storedState.lastKnownWordCount === "number" &&
+    typeof storedState.lastAutoCheckWordCount === "number"
+  ) {
+    return {
+      lastKnownWordCount: storedState.lastKnownWordCount,
+      lastAutoCheckWordCount: storedState.lastAutoCheckWordCount,
+      reviewCursorEntryId: typeof storedState.reviewCursorEntryId === "string" ? storedState.reviewCursorEntryId : undefined,
+      pendingSceneBreak: storedState.pendingSceneBreak === true,
+      pendingSceneBreakCharCount:
+        typeof storedState.pendingSceneBreakCharCount === "number" ? storedState.pendingSceneBreakCharCount : undefined,
+      sectionSummaries: Array.isArray(storedState.sectionSummaries) ? storedState.sectionSummaries : undefined,
+    };
+  }
+
+  return createInitialReviewerState(initialWordCount);
+}
+
+async function loadReviewerState(
+  currentWordCount: number,
+  storedState?: Partial<ReviewerState>,
+): Promise<ReviewerState> {
+  const resolvedStoredState = storedState ?? await readStoredReviewerState();
+  const state = normalizeReviewerState(resolvedStoredState, currentWordCount);
+
+  if (!resolvedStoredState) {
+    await saveReviewerState(state);
+  }
+
+  return state;
+}
+
+async function saveReviewerState(state: ReviewerState): Promise<void> {
+  await api.v1.storyStorage.set(STORAGE_STATE_KEY, state);
+}
+
+async function resetAutoCheckBaseline(): Promise<void> {
+  const snapshot = await getStorySnapshot();
+  const state = createInitialReviewerState(snapshot.wordCount);
+  state.sectionSummaries = snapshot.sectionSummaries;
+
+  await saveReviewerState(state);
+  await api.v1.ui.toast(`Lorebook Growth Reviewer baseline reset at ${snapshot.wordCount} words.`, {
+    type: "success",
+  });
+}
+
+async function hasSceneBreakSince(startCharCount: number | undefined): Promise<boolean> {
+  if (typeof startCharCount !== "number" || startCharCount < 0) {
+    return false;
+  }
+
+  const sections = await getStorySections();
+  let totalCharCount = 0;
+
+  for (let index = 0; index < sections.length; index += 1) {
+    totalCharCount += sections[index].text.length;
+    if (index > 0) {
+      totalCharCount += 2;
+    }
+  }
+
+  const charsSinceThreshold = Math.max(0, totalCharCount - startCharCount);
+  let scannedChars = 0;
+
+  for (let index = sections.length - 1; index >= 0; index -= 1) {
+    const text = sections[index].text;
+    if (text.includes("***")) {
+      return true;
+    }
+
+    scannedChars += text.length;
+    if (index > 0) {
+      scannedChars += 2;
+    }
+
+    if (scannedChars >= charsSinceThreshold) {
+      break;
+    }
+  }
+
+  return false;
+}
+
+async function refreshToolbarButton(pendingSceneBreak: boolean): Promise<void> {
+  await api.v1.ui.register([
+    api.v1.ui.extension.toolbarButton({
+      id: TOOLBAR_BUTTON_ID,
+      text: pendingSceneBreak ? "Lore Review (*)" : "Lore Review",
+      iconId: "file-text",
+      callback: async () => {
+        await showStatusModal();
+      },
+    }),
+  ]);
+}
+
+async function cycleEntryOverride(entryId: string): Promise<ReviewOverrideMode | undefined> {
+  const overrides = await loadReviewOverrides();
+  const nextMode = nextOverrideMode(overrides[entryId]);
+
+  if (nextMode === undefined) {
+    delete overrides[entryId];
+  } else {
+    overrides[entryId] = nextMode;
+  }
+
+  await saveReviewOverrides(overrides);
+  return nextMode;
+}
+
+function extractJsonObject(rawText: string): string {
+  const trimmedText = rawText.trim();
+  const fencedMatch = trimmedText.match(/```(?:json)?\s*([\s\S]*?)\s*```/iu);
+  const candidateText = fencedMatch ? fencedMatch[1].trim() : trimmedText;
+  const firstBrace = candidateText.indexOf("{");
+  const lastBrace = candidateText.lastIndexOf("}");
+
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
+    throw new Error("Model response did not contain JSON.");
+  }
+
+  return candidateText.slice(firstBrace, lastBrace + 1);
+}
+
+function parseReviewResult(rawText: string): LorebookReviewResult {
+  const parsed = JSON.parse(extractJsonObject(rawText)) as Partial<LorebookReviewResult>;
+  return {
+    hasUpdate: parsed.hasUpdate === true,
+    proposalItems: normalizeProposalItems((parsed as { proposalItems?: unknown }).proposalItems),
+    rationale: typeof parsed.rationale === "string" ? parsed.rationale.trim() : undefined,
+  };
+}
+
+function summarizeRawResponse(rawText: string): string {
+  const compact = rawText.replace(/\s+/gu, " ").trim();
+  return compact.length > 500 ? `${compact.slice(0, 500)}...` : compact;
+}
+
+async function estimateRequiredInputTokens(messages: GenerationMessage[]): Promise<number> {
+  try {
+    const countedTokens = await api.v1.script.countUncachedInputTokens(messages);
+    if (typeof countedTokens === "number" && Number.isFinite(countedTokens)) {
+      return countedTokens;
+    }
+  } catch (error) {
+    api.v1.log("Lorebook Growth Reviewer could not count uncached input tokens exactly, using a conservative estimate.");
+  }
+
+  const serialized = JSON.stringify(messages);
+  return Math.max(1, Math.ceil(serialized.length / 3));
+}
+
+function generateInBackground(messages: GenerationMessage[], maxOutputTokens: number): Promise<any> {
+  return api.v1.generate(
+    messages,
+    {
+      model: MODEL,
+      max_tokens: maxOutputTokens,
+      temperature: 0.1,
+      top_p: 0.8,
+    },
+    undefined,
+    "background",
+  );
+}
+
+async function generateWithBudgetWait(
+  messages: GenerationMessage[],
+  maxOutputTokens: number,
+  waitLabel = "generation",
+): Promise<any> {
+  const requiredInputTokens = await estimateRequiredInputTokens(messages);
+  let hasShownWaitToast = false;
+
+  while (true) {
+    const allowedInput = await api.v1.script.getAllowedInput();
+    const allowedOutput = await api.v1.script.getAllowedOutput();
+
+    if (allowedInput >= requiredInputTokens && allowedOutput >= maxOutputTokens) {
+      if (reviewProgress) {
+        reviewProgress.phase = "reviewing";
+        reviewProgress.waitUntil = undefined;
+        reviewProgress.waitReason = undefined;
+      }
+      return generateInBackground(messages, maxOutputTokens);
+    }
+
+    const waits: Promise<unknown>[] = [];
+    const waitMessages: string[] = [];
+    const knownDelays: number[] = [];
+
+    if (allowedInput < requiredInputTokens) {
+      waits.push(api.v1.script.waitForAllowedInput(requiredInputTokens));
+      const inputDelayMs = await api.v1.script.getTimeUntilAllowedInput(requiredInputTokens);
+      if (typeof inputDelayMs === "number" && Number.isFinite(inputDelayMs) && inputDelayMs >= 0) {
+        knownDelays.push(inputDelayMs);
+        waitMessages.push(`input ${Math.ceil(inputDelayMs / 1000)}s`);
+      } else {
+        waitMessages.push("input");
+      }
+    }
+
+    if (allowedOutput < maxOutputTokens) {
+      waits.push(api.v1.script.waitForAllowedOutput(maxOutputTokens));
+      const outputDelayMs = await api.v1.script.getTimeUntilAllowedOutput(maxOutputTokens);
+      if (typeof outputDelayMs === "number" && Number.isFinite(outputDelayMs) && outputDelayMs >= 0) {
+        knownDelays.push(outputDelayMs);
+        waitMessages.push(`output ${Math.ceil(outputDelayMs / 1000)}s`);
+      } else {
+        waitMessages.push("output");
+      }
+    }
+
+    if (reviewProgress) {
+      reviewProgress.phase = "waiting";
+      reviewProgress.waitUntil = knownDelays.length > 0 ? Date.now() + Math.max(...knownDelays) : undefined;
+      reviewProgress.waitReason = waitMessages.join(", ");
+    }
+
+    api.v1.log(
+      `Lorebook Growth Reviewer waiting for generation budget. Need input ${requiredInputTokens}, have ${allowedInput}; need output ${maxOutputTokens}, have ${allowedOutput}. Waiting for ${waitMessages.join(", ")}.`,
+    );
+    if (!hasShownWaitToast) {
+      hasShownWaitToast = true;
+      await api.v1.ui.toast(
+        `Waiting for token budget before ${waitLabel}: ${waitMessages.join(", ")}.`,
+        {
+          type: "info",
+        },
+      );
+    }
+    if (waits.length === 0) {
+      return generateInBackground(messages, maxOutputTokens);
+    }
+
+    await Promise.all(waits);
+  }
+}
+
+async function compactOversizedLorebookEntry(entry: LorebookListEntry): Promise<LorebookSuggestion | undefined> {
+  const expectedNameLine = expectedLorebookNameLine(entry);
+  const compactionSourceText = buildCompactionSourceText(entry.text, MAX_COMPACTION_INPUT_CHARS);
+  const response = await generateWithBudgetWait(
+    [
+      {
+        role: "system",
+        content:
+          "You compact oversized lorebook entries. Respond only as compact JSON with keys: hasUpdate boolean, compactedText string, rationale string. If the entry should be compacted, compactedText must be a shorter replacement that preserves the most important facts. The compacted text must start with ---- on the first line. The second line must be the exact original character name line, unchanged. The third line must begin with Type: character. Keep the result concise, prioritized, and easy to extend later. If no compaction is needed, hasUpdate must be false and compactedText must equal the original text.",
+      },
+      {
+        role: "user",
+        content:
+          `Lorebook entry name: ${JSON.stringify(entry.displayName)}\n` +
+          `Required second line: ${JSON.stringify(expectedNameLine)}\n` +
+          `Current length in characters: ${entry.text.length}\n\n` +
+          `Current lorebook text:\n${compactionSourceText}\n\n` +
+          "Rewrite this as a shorter lorebook entry while preserving the essential identity, status, and major facts. Remove redundancy and keep only the most important details.",
+      },
+    ],
+    MAX_COMPACTION_OUTPUT_TOKENS,
+    `compacting ${entry.displayName}`,
+  );
+
+  const rawText = response.choices[0]?.text ?? "";
+  let parsed: {
+    hasUpdate?: boolean;
+    compactedText?: string;
+    rationale?: string;
+  };
+  try {
+    parsed = JSON.parse(extractJsonObject(rawText));
+  } catch (error) {
+    api.v1.error(
+      `Lorebook compaction received invalid JSON for "${entry.displayName}":`,
+      summarizeRawResponse(rawText),
+    );
+    return undefined;
+  }
+
+  const compactedText = validateCompactedLorebook(
+    typeof parsed.compactedText === "string" ? parsed.compactedText : "",
+    expectedNameLine,
+  );
+  if (parsed.hasUpdate !== true || !compactedText || compactedText === entry.text || compactedText.length >= entry.text.length) {
+    return undefined;
+  }
+
+  return {
+    entryId: entry.id,
+    displayName: entry.displayName,
+    currentText: entry.text,
+    proposalItems: [
+      {
+        fact: "Compacted lorebook entry",
+        addition: compactedText,
+      },
+    ],
+    rationale: typeof parsed.rationale === "string" ? parsed.rationale.trim() : "Compacted oversized lorebook entry.",
+    mode: "compaction",
+  };
+}
+
+function salvageReviewResult(rawText: string): LorebookReviewResult | undefined {
+  const trimmedText = rawText.trim();
+  if (!trimmedText) {
+    return undefined;
+  }
+
+  const lowered = trimmedText.toLowerCase();
+  if (
+    lowered.includes("no new facts") ||
+    lowered.includes("no update") ||
+    lowered.includes("no changes needed") ||
+    lowered.includes("no changes necessary")
+  ) {
+    return {
+      hasUpdate: false,
+      proposalItems: [],
+      rationale: "Model reported no update outside the expected JSON format.",
+    };
+  }
+
+  const proposalItems = Array.from(
+    trimmedText.matchAll(/"fact"\s*:\s*"([\s\S]*?)"\s*,\s*"addition"\s*:\s*"([\s\S]*?)"/gu),
+  )
+    .map((match) => ({
+      fact: normalizeText(match[1].replace(/\\n/gu, "\n").replace(/\\"/gu, "\"")),
+      addition: normalizeText(match[2].replace(/\\n/gu, "\n").replace(/\\"/gu, "\"")),
+    }))
+    .filter((item) => item.fact && item.addition);
+
+  if (proposalItems.length > 0) {
+    return {
+      hasUpdate: true,
+      proposalItems,
+      rationale: "Recovered from a truncated JSON model response.",
+    };
+  }
+
+  const proposedMatch =
+    trimmedText.match(/proposed(?:\s+addition|\s+text)?\s*:\s*([\s\S]+)/iu) ??
+    trimmedText.match(/addition\s*:\s*([\s\S]+)/iu);
+  if (!proposedMatch) {
+    return undefined;
+  }
+
+  return {
+    hasUpdate: true,
+    proposalItems: [
+      {
+        fact: "Recovered proposal",
+        addition: normalizeText(proposedMatch[1]),
+      },
+    ],
+    rationale: "Recovered from a non-JSON model response.",
+  };
+}
+
+async function reviewSingleLorebookEntry(
+  entry: LorebookListEntry,
+  recentStoryExcerpt: string,
+): Promise<LorebookSuggestion | undefined> {
+  const currentText = normalizeText(entry.text);
+  if (!currentText) {
+    return undefined;
+  }
+
+  if (currentText.length > MAX_LOREBOOK_ENTRY_CHARS) {
+    return compactOversizedLorebookEntry(entry);
+  }
+
+  if (countWords(currentText) > MAX_LOREBOOK_ENTRY_WORDS) {
+    api.v1.log(
+      `Lorebook Growth Reviewer skipped entry "${entry.displayName ?? entry.id}" because it exceeds ${MAX_LOREBOOK_ENTRY_WORDS} words.`,
+    );
+    return undefined;
+  }
+
+  const basePrompt =
+    `Lorebook entry name: ${JSON.stringify(entry.displayName ?? "Untitled Entry")}\n` +
+    `Subject name line: ${JSON.stringify(expectedLorebookNameLine(entry))}\n` +
+    `Lorebook keys: ${JSON.stringify(entry.keys ?? [])}\n` +
+    `Existing lorebook text:\n${currentText}\n\n` +
+    `Recent story excerpt:\n${recentStoryExcerpt}\n\n` +
+    "If there are reliable new facts for this same subject, propose them as separate additions. Every addition must be explicitly about this lorebook subject, not another nearby character. Write each addition as a subject-centric fact sentence that starts with the subject's name or a direct pronoun for the subject. If a fact is mainly about someone else, or only matters to another character, exclude it. Do not rewrite or repeat the existing entry text.";
+
+  let result: LorebookReviewResult | undefined;
+  let lastRawResponse = "";
+
+  for (const strictRetry of [false, true]) {
+    try {
+      const response = await generateWithBudgetWait(
+        [
+          {
+            role: "system",
+            content:
+              `You review a story excerpt against one lorebook entry. Decide whether the story establishes reliable new facts that belong in the entry. Be conservative. Only include facts that directly describe the lorebook subject itself, such as its identity, status, abilities, possessions, goals, legal situation, residence, relationships, or subject-centric actions. Reject facts that are primarily about another character, even if that other character appears near the subject in the excerpt. Ignore style tweaks, speculation, ambiguous implications, and details already covered by the existing entry. Do not repeat information already present in the existing lorebook text. Respond only as compact JSON with keys: hasUpdate boolean, proposalItems array, rationale string. proposalItems must be an array of objects with keys fact and addition. Each addition must contain only the new text to append for that one fact, not a rewrite of the whole entry. Each addition must be phrased as a subject-centric sentence beginning with the subject's name or a direct pronoun for the subject. Limit proposalItems to at most ${MAX_FACTS_PER_ENTRY} short items. Keep additions concise. Keep rationale to one short sentence. If hasUpdate is false, proposalItems must be an empty array.`,
+          },
+          {
+            role: "user",
+            content: strictRetry
+              ? `${basePrompt}\n\nReturn only valid JSON. Do not use markdown fences. Do not add any explanatory text before or after the JSON object.`
+              : basePrompt,
+          },
+        ],
+        MAX_REVIEW_OUTPUT_TOKENS,
+        `reviewing ${entry.displayName}`,
+      );
+
+      lastRawResponse = response.choices[0]?.text ?? "";
+      result = parseReviewResult(response.choices[0]?.text ?? "");
+      break;
+    } catch (error) {
+      const salvagedResult = salvageReviewResult(lastRawResponse);
+      if (salvagedResult) {
+        api.v1.log(
+          `Lorebook Growth Reviewer salvaged a non-JSON response for "${entry.displayName ?? entry.id}": ${summarizeRawResponse(lastRawResponse)}`,
+        );
+        result = salvagedResult;
+        break;
+      }
+
+      api.v1.error(
+        `Lorebook Growth Reviewer received an invalid response for "${entry.displayName ?? entry.id}" on ${strictRetry ? "strict retry" : "first pass"}:`,
+        summarizeRawResponse(lastRawResponse),
+      );
+      if (strictRetry) {
+        throw error;
+      }
+    }
+  }
+
+  if (!result) {
+    throw new Error("Lorebook review did not produce a valid result.");
+  }
+
+  const proposalItems = result.proposalItems
+    .map((item) => ({
+      fact: normalizeText(item.fact),
+      addition: normalizeText(item.addition),
+    }))
+    .filter((item) => item.fact && item.addition)
+    .filter((item) => isSubjectRelevantAddition(entry, item.fact, item.addition))
+    .filter((item) => !isRepeatedAddition(currentText, item.addition));
+
+  if (!result.hasUpdate || proposalItems.length === 0) {
+    return undefined;
+  }
+
+  return {
+    entryId: entry.id,
+    displayName: entry.displayName ?? "Untitled Entry",
+    currentText,
+    proposalItems,
+    rationale: result.rationale,
+    mode: "additions",
+  };
+}
+
+async function ensureLorebookEditPermission(): Promise<boolean> {
+  const hasPermission = await api.v1.permissions.has("lorebookEdit");
+  if (hasPermission) {
+    return true;
+  }
+
+  return api.v1.permissions.request(
+    "lorebookEdit",
+    "Lorebook Growth Reviewer needs permission to update lorebook entries when you accept a suggested revision.",
+  );
+}
+
+function buildUpdatedLorebookText(suggestion: LorebookSuggestion, items: LorebookProposalItem[]): string {
+  if (suggestion.mode === "compaction") {
+    return items[0]?.addition ?? suggestion.currentText;
+  }
+
+  return `${suggestion.currentText}\n\n${items.map((item) => item.addition).join("\n\n")}`.trim();
+}
+
+async function applySelectedLorebookSuggestion(
+  suggestion: LorebookSuggestion,
+  selectedIndexes: Set<number>,
+): Promise<boolean> {
+  const selectedItems = suggestion.proposalItems.filter((_, index) => selectedIndexes.has(index));
+  if (selectedItems.length === 0) {
+    await api.v1.ui.toast("No facts selected. No changes made.", {
+      type: "warning",
+    });
+    return false;
+  }
+
+  const granted = await ensureLorebookEditPermission();
+  if (!granted) {
+    await api.v1.ui.toast("Permission denied. The lorebook entry was not updated.", {
+      type: "warning",
+    });
+    return false;
+  }
+
+  await api.v1.lorebook.updateEntry(suggestion.entryId, {
+    text: buildUpdatedLorebookText(suggestion, selectedItems),
+  });
+  return true;
+}
+
+async function saveIntervalAndToast(value: number): Promise<void> {
+  const savedValue = await setConfiguredIntervalWords(value);
+  await api.v1.ui.toast(`Lorebook review interval set to ${savedValue} words.`, {
+    type: "success",
+  });
+}
+
+async function showCompletionModal(message: string): Promise<void> {
+  await api.v1.ui.modal.open({
+    title: "Lorebook Growth Reviewer",
+    size: "small",
+    content: [
+      {
+        type: "text",
+        text: message,
+      },
+    ],
+  });
+}
+
+async function toggleAutoAccept(): Promise<boolean> {
+  const enabled = !(await loadAutoAcceptEnabled());
+  await saveAutoAcceptEnabled(enabled);
+  await api.v1.ui.toast(`Auto-accept ${enabled ? "enabled" : "disabled"}.`, {
+    type: "success",
+  });
+  return enabled;
+}
+
+function buildSuggestionMarkdown(suggestion: LorebookSuggestion): string {
+  const rationaleBlock = suggestion.rationale ? `\nReasoning: ${suggestion.rationale}\n` : "\n";
+
+  return (
+    `**${suggestion.displayName}**\n\n` +
+    `${suggestion.mode === "compaction" ? "Oversized entry compaction" : `Proposed facts: ${suggestion.proposalItems.length}`}${rationaleBlock}\n` +
+    `Current entry:\n\`\`\`\n${escapeFence(suggestion.currentText)}\n\`\`\`\n\n` +
+    `${suggestion.mode === "compaction" ? "Review the compacted replacement below." : "Review the individual additions below."}`
+  );
+}
+
+function summarizeAcceptedFacts(suggestion: LorebookSuggestion): string {
+  if (suggestion.mode === "compaction") {
+    return `${suggestion.displayName}: compacted oversized entry.`;
+  }
+
+  const factSummary = suggestion.proposalItems
+    .map((item, index) => `${index + 1}. ${item.fact}`)
+    .join("\n");
+
+  return `${suggestion.displayName}:\n${factSummary}`;
+}
+
+function rotateEntriesFromCursor(entries: LorebookEntrySummary[], cursorEntryId: string | undefined): LorebookEntrySummary[] {
+  if (!cursorEntryId || entries.length <= 1) {
+    return entries;
+  }
+
+  const cursorIndex = entries.findIndex((entry) => entry.id === cursorEntryId);
+  if (cursorIndex === -1) {
+    return entries;
+  }
+
+  if (cursorIndex === entries.length - 1) {
+    return [...entries];
+  }
+
+  return [...entries.slice(cursorIndex + 1), ...entries.slice(0, cursorIndex + 1)];
+}
+
+function shouldReviewLorebookEntrySummary(entry: LorebookEntrySummary, overrides: ReviewOverrides): boolean {
+  const overrideMode = overrides[entry.id];
+  if (overrideMode === "skip") {
+    return false;
+  }
+
+  if (overrideMode === "force") {
+    return true;
+  }
+
+  return entry.enabled;
+}
+
+type LorebookCollectionResult = {
+  suggestions: LorebookSuggestion[];
+  lastProcessedEntryId?: string;
+  appliedCount: number;
+};
+
+async function showSuggestionsModal(suggestions: LorebookSuggestion[], currentWordCount: number, intervalWords: number): Promise<void> {
+  const content: any[] = [
+    {
+      type: "text",
+      text:
+        `Review complete. ${suggestions.length} lorebook entr${suggestions.length === 1 ? "y has" : "ies have"} suggested updates.\n\n` +
+        `Story length: ${currentWordCount} words\nReview interval: ${intervalWords} words`,
+      markdown: true,
+    },
+  ];
+
+  for (let index = 0; index < suggestions.length; index += 1) {
+    const suggestion = suggestions[index];
+    const statusId = `lorebook-review-status-${index}`;
+    const selectedIndexes = new Set<number>(suggestion.proposalItems.map((_, itemIndex) => itemIndex));
+
+    content.push(
+      {
+        text: buildSuggestionMarkdown(suggestion),
+        markdown: true,
+        type: "text",
+      },
+    );
+    for (let itemIndex = 0; itemIndex < suggestion.proposalItems.length; itemIndex += 1) {
+      const item = suggestion.proposalItems[itemIndex];
+      const itemStatusId = `lorebook-review-item-${index}-${itemIndex}`;
+
+      content.push({
+        type: "text",
+        markdown: true,
+        text: suggestion.mode === "compaction"
+          ? `**Compacted replacement**\n\n\`\`\`\n${escapeFence(item.addition)}\n\`\`\``
+          : `**Fact ${itemIndex + 1}:** ${item.fact}\n\nProposed addition:\n\`\`\`\n${escapeFence(item.addition)}\n\`\`\``,
+      });
+      content.push({
+        id: itemStatusId,
+        type: "text",
+        text: "Selected",
+      });
+      content.push({
+        type: "button",
+        text: "Toggle Selection",
+        callback: async () => {
+          if (selectedIndexes.has(itemIndex)) {
+            selectedIndexes.delete(itemIndex);
+          } else {
+            selectedIndexes.add(itemIndex);
+          }
+
+          await api.v1.ui.updateParts([
+            {
+              id: itemStatusId,
+              text: selectedIndexes.has(itemIndex) ? "Selected" : "Unselected",
+            },
+          ]);
+        },
+      });
+    }
+    content.push(
+      {
+        type: "button",
+        text: "Accept Selected Facts",
+        callback: async () => {
+          try {
+            const applied = await applySelectedLorebookSuggestion(suggestion, selectedIndexes);
+            if (applied) {
+              await api.v1.ui.updateParts([
+                {
+                  id: statusId,
+                  text: "Accepted selected facts. Lorebook entry updated.",
+                  markdown: false,
+                },
+              ]);
+            }
+          } catch (error) {
+            api.v1.error("Failed to apply lorebook suggestion:", error);
+            await api.v1.ui.updateParts([
+              {
+                id: statusId,
+                text: "Failed to apply update. Check the script log.",
+                markdown: false,
+              },
+            ]);
+          }
+        },
+      },
+    );
+    content.push(
+      {
+        type: "button",
+        text: "Decline All",
+        callback: async () => {
+          await api.v1.ui.updateParts([
+            {
+              id: statusId,
+              text: "Declined. No changes made.",
+              markdown: false,
+            },
+          ]);
+        },
+      },
+    );
+    content.push(
+      {
+        id: statusId,
+        text: "All facts selected by default.",
+        type: "text",
+      },
+    );
+  }
+
+  await api.v1.ui.modal.open({
+    title: "Lorebook Review Suggestions",
+    size: "large",
+    content,
+  });
+}
+
+async function collectLorebookSuggestions(
+  excerptTargetWords: number,
+  cursorEntryId: string | undefined,
+  reviewAllEntries: boolean,
+  autoAcceptEnabled: boolean,
+): Promise<LorebookCollectionResult> {
+  const recentStoryExcerpt = await getRecentStoryExcerpt(excerptTargetWords);
+  if (!recentStoryExcerpt) {
+    return { suggestions: [], lastProcessedEntryId: cursorEntryId, appliedCount: 0 };
+  }
+
+  const entries = await getLorebookEntries();
+  const overrides = await loadReviewOverrides();
+  const suggestions: LorebookSuggestion[] = [];
+  let processedEntries = 0;
+  let gatheredFacts = 0;
+  let appliedCount = 0;
+  const maxEntriesToReview = Math.max(1, Math.floor(TARGET_FACTS_PER_RUN / MAX_FACTS_PER_ENTRY));
+  let lastProcessedEntryId = cursorEntryId;
+  let reviewableEntryCount = 0;
+
+  for (const entry of entries) {
+    if (shouldReviewLorebookEntrySummary(entry, overrides)) {
+      reviewableEntryCount += 1;
+    }
+  }
+
+  if (reviewableEntryCount === 0) {
+    return { suggestions: [], lastProcessedEntryId: cursorEntryId, appliedCount: 0 };
+  }
+
+  const reviewQueue = rotateEntriesFromCursor(entries, cursorEntryId).filter((entry) =>
+    shouldReviewLorebookEntrySummary(entry, overrides),
+  );
+  let reviewLimit = reviewAllEntries ? reviewableEntryCount : Math.min(reviewableEntryCount, maxEntriesToReview);
+  if (reviewProgress) {
+    reviewProgress.phase = "reviewing";
+    reviewProgress.totalEntries = reviewLimit;
+  }
+
+  while (reviewQueue.length > 0 && processedEntries < reviewLimit) {
+    const entrySummary = reviewQueue.shift();
+    if (!entrySummary) {
+      break;
+    }
+
+    processedEntries += 1;
+    lastProcessedEntryId = entrySummary.id;
+
+    if (processedEntries === 1 || processedEntries === reviewLimit) {
+      await api.v1.ui.toast(
+        `Lorebook Growth Reviewer is reviewing entry ${processedEntries} of ${reviewLimit}...`,
+        {
+          type: "info",
+        },
+      );
+    }
+
+    try {
+      const entry = await getLorebookEntryById(entrySummary.id);
+      if (!entry || !entry.text) {
+        await api.v1.ui.toast(
+          `Skipped lorebook "${entrySummary.displayName}" because its entry text is unavailable.`,
+          {
+            type: "info",
+          },
+        );
+        continue;
+      }
+
+      if (!isLorebookEntryMentioned(entry, recentStoryExcerpt)) {
+        api.v1.log(
+          `Lorebook Growth Reviewer skipped "${entry.displayName ?? entry.id}" because its character was not mentioned in the review text.`,
+        );
+        await api.v1.ui.toast(
+          `Skipped lorebook "${entry.displayName}" - character not mentioned.`,
+          {
+            type: "info",
+          },
+        );
+        continue;
+      }
+
+      const suggestion = await reviewSingleLorebookEntry(entry, recentStoryExcerpt);
+      await api.v1.ui.toast(`Reviewed lorebook "${entry.displayName}".`, {
+        type: "info",
+      });
+      if (suggestion) {
+        if (reviewAllEntries) {
+          if (autoAcceptEnabled) {
+            const selectedIndexes = new Set<number>(suggestion.proposalItems.map((_, suggestionIndex) => suggestionIndex));
+            const applied = await applySelectedLorebookSuggestion(suggestion, selectedIndexes);
+            if (applied) {
+              appliedCount += 1;
+              if (suggestion.mode === "compaction") {
+                reviewQueue.push(entrySummary);
+                reviewLimit += 1;
+                if (reviewProgress) {
+                  reviewProgress.totalEntries = reviewLimit;
+                }
+              }
+              api.v1.log(
+                `Lorebook Growth Reviewer auto-accepted updates for "${suggestion.displayName}":\n${summarizeAcceptedFacts(suggestion)}`,
+              );
+              await api.v1.ui.toast(
+                `Auto-accepted ${suggestion.proposalItems.length} ${suggestion.proposalItems.length === 1 ? "fact" : "facts"} for ${suggestion.displayName}.`,
+                {
+                  type: "success",
+                },
+              );
+            }
+          } else {
+            suggestions.push(suggestion);
+          }
+          gatheredFacts += suggestion.proposalItems.length;
+        } else {
+          const remainingFactBudget = TARGET_FACTS_PER_RUN - gatheredFacts;
+          if (remainingFactBudget <= 0) {
+            break;
+          }
+
+          const trimmedItems = suggestion.proposalItems.slice(0, remainingFactBudget);
+          if (trimmedItems.length > 0) {
+            suggestion.proposalItems = trimmedItems;
+            suggestions.push(suggestion);
+            gatheredFacts += trimmedItems.length;
+          }
+        }
+      }
+    } catch (error) {
+      api.v1.error(
+        `Lorebook Growth Reviewer skipped entry "${entrySummary.displayName}" because its review response was invalid:`,
+        error,
+      );
+    } finally {
+      if (reviewProgress) {
+        reviewProgress.completedEntries = processedEntries;
+      }
+    }
+
+    if (!reviewAllEntries && gatheredFacts >= TARGET_FACTS_PER_RUN) {
+      break;
+    }
+  }
+
+  return {
+    suggestions,
+    lastProcessedEntryId,
+    appliedCount,
+  };
+}
+
+async function showOverridesModal(): Promise<void> {
+  const entries = await getLorebookEntries();
+  const overrides = await loadReviewOverrides();
+  const content: any[] = [
+    {
+      type: "text",
+      text:
+        "Cycle each entry through `Default`, `Skip`, and `Force`.\n\n" +
+        "`Skip` prevents review for this story. `Force` includes the entry even if it would normally be filtered.",
+      markdown: true,
+    },
+  ];
+
+  const sortedEntries = [...entries].sort((left, right) => left.displayName.localeCompare(right.displayName));
+
+  for (const entry of sortedEntries) {
+    const statusId = `lorebook-override-${entry.id}`;
+    const currentMode = overrides[entry.id];
+    content.push({
+      type: "text",
+      text: `**${entry.displayName}**`,
+      markdown: true,
+    });
+    content.push({
+      id: statusId,
+      type: "text",
+      text: `Mode: ${overrideLabel(currentMode)}`,
+    });
+    content.push({
+      type: "button",
+      text: `Cycle Mode (${overrideLabel(currentMode)})`,
+      callback: async () => {
+        const nextMode = await cycleEntryOverride(entry.id);
+        await api.v1.ui.updateParts([
+          {
+            id: statusId,
+            text: `Mode: ${overrideLabel(nextMode)}`,
+          },
+        ]);
+        await api.v1.ui.toast(`${entry.displayName}: ${overrideLabel(nextMode)}`, {
+          type: "success",
+        });
+      },
+    });
+    content.push({
+      type: "button",
+      text: "Review This Lorebook Through Current Story",
+      callback: async () => {
+        await runSingleLorebookReview(entry.id);
+      },
+    });
+  }
+
+  await api.v1.ui.modal.open({
+    title: "Lorebook Review Overrides",
+    size: "large",
+    content,
+  });
+}
+
+async function runSingleLorebookReview(entryId: string): Promise<void> {
+  if (isReviewRunning) {
+    await api.v1.ui.toast(`Lorebook Growth Reviewer is already running. ${getReviewProgressText()}`, {
+      type: "info",
+    });
+    return;
+  }
+
+  isReviewRunning = true;
+  reviewProgress = { phase: "preparing", completedEntries: 0, totalEntries: 0 };
+  try {
+    const entry = await getLorebookEntryById(entryId);
+    if (!entry || !entry.text) {
+      await api.v1.ui.toast("This lorebook entry is unavailable or empty.", { type: "error" });
+      return;
+    }
+
+    const chunks = splitStoryIntoReviewChunks(await getStorySections());
+    if (chunks.length === 0) {
+      await api.v1.ui.toast("There is no story text to review yet.", { type: "info" });
+      return;
+    }
+
+    reviewProgress.phase = "reviewing";
+    reviewProgress.totalEntries = chunks.length;
+    const autoAcceptEnabled = await loadAutoAcceptEnabled();
+    if (entry.text.length > MAX_LOREBOOK_ENTRY_CHARS) {
+      const suggestion = await compactOversizedLorebookEntry(entry);
+      if (suggestion) {
+        if (autoAcceptEnabled) {
+          const applied = await applySelectedLorebookSuggestion(suggestion, new Set([0]));
+          await showCompletionModal(applied
+            ? `Lorebook Growth Reviewer auto-accepted the compaction for ${entry.displayName}.`
+            : `Lorebook Growth Reviewer could not apply the compaction for ${entry.displayName}.`);
+        } else {
+          await showSuggestionsModal([suggestion], (await getStorySnapshot()).wordCount, await getConfiguredIntervalWords());
+        }
+      } else {
+        await showCompletionModal(`${entry.displayName} did not need compaction.`);
+      }
+      return;
+    }
+    const proposalItems: LorebookProposalItem[] = [];
+    let rationale: string | undefined;
+    for (let index = 0; index < chunks.length; index += 1) {
+      reviewProgress.completedEntries = index;
+      await api.v1.ui.toast(`Reviewing ${entry.displayName}: story section ${index + 1} of ${chunks.length}...`, {
+        type: "info",
+      });
+      if (!isLorebookEntryMentioned(entry, chunks[index])) {
+        continue;
+      }
+      const suggestion = await reviewSingleLorebookEntry(entry, chunks[index]);
+      if (suggestion) {
+        rationale = suggestion.rationale ?? rationale;
+        for (const item of suggestion.proposalItems) {
+          if (!proposalItems.some((existing) => normalizeForComparison(existing.addition) === normalizeForComparison(item.addition))) {
+            proposalItems.push(item);
+          }
+        }
+      }
+    }
+    reviewProgress.completedEntries = chunks.length;
+    if (proposalItems.length === 0) {
+      await showCompletionModal(`Lorebook Growth Reviewer found no new updates for ${entry.displayName} in the story so far.`);
+      return;
+    }
+
+    const combinedSuggestion: LorebookSuggestion = {
+      entryId: entry.id,
+      displayName: entry.displayName,
+      currentText: entry.text,
+      proposalItems: proposalItems.slice(-MAX_FACTS_PER_ENTRY),
+      rationale,
+    };
+    if (autoAcceptEnabled) {
+      const selectedIndexes = new Set<number>(combinedSuggestion.proposalItems.map((_, index) => index));
+      const applied = await applySelectedLorebookSuggestion(combinedSuggestion, selectedIndexes);
+      if (applied) {
+        api.v1.log(`Lorebook Growth Reviewer auto-accepted updates for "${entry.displayName}":\n${summarizeAcceptedFacts(combinedSuggestion)}`);
+        await api.v1.ui.toast(`Auto-accepted ${combinedSuggestion.proposalItems.length} ${combinedSuggestion.proposalItems.length === 1 ? "fact" : "facts"} for ${entry.displayName}.`, {
+          type: "success",
+        });
+      }
+      await showCompletionModal(applied
+        ? `Lorebook Growth Reviewer auto-accepted updates for ${entry.displayName}.`
+        : `Lorebook Growth Reviewer could not apply updates for ${entry.displayName}.`);
+    } else {
+      await showSuggestionsModal([combinedSuggestion], (await getStorySnapshot()).wordCount, await getConfiguredIntervalWords());
+    }
+  } catch (error) {
+    api.v1.error(`Lorebook Growth Reviewer failed while reviewing entry ${entryId}:`, error);
+    await api.v1.ui.toast("Lorebook review failed. Check the script log for details.", { type: "error" });
+  } finally {
+    isReviewRunning = false;
+    reviewProgress = undefined;
+  }
+}
+
+async function runLorebookReview(trigger: string, force = false): Promise<void> {
+  if (isReviewRunning) {
+    await api.v1.ui.toast(`Lorebook Growth Reviewer is already running. ${getReviewProgressText()}`, {
+      type: "info",
+    });
+    return;
+  }
+
+  isReviewRunning = true;
+  reviewProgress = {
+    phase: "preparing",
+    completedEntries: 0,
+    totalEntries: 0,
+  };
+
+  try {
+    const storedState = await readStoredReviewerState();
+    const previousSummaries = Array.isArray(storedState?.sectionSummaries) ? storedState.sectionSummaries : undefined;
+    const snapshot = await getStorySnapshot(previousSummaries);
+    const currentWordCount = snapshot.wordCount;
+    const intervalWords = await getConfiguredIntervalWords();
+    const autoAcceptEnabled = await loadAutoAcceptEnabled();
+    const state = await loadReviewerState(currentWordCount, storedState);
+    const wordsSinceLastCheck = Math.max(0, currentWordCount - state.lastAutoCheckWordCount);
+    const excerptTargetWords = Math.min(MAX_RECENT_STORY_WORDS, intervalWords + RECENT_STORY_PADDING_WORDS);
+
+    state.lastKnownWordCount = currentWordCount;
+    state.sectionSummaries = snapshot.sectionSummaries;
+
+    if (!force && !state.pendingSceneBreak && wordsSinceLastCheck < intervalWords) {
+      await saveReviewerState(state);
+      return;
+    }
+
+    if (!force && !state.pendingSceneBreak && wordsSinceLastCheck >= intervalWords) {
+      state.pendingSceneBreak = true;
+      state.pendingSceneBreakCharCount = snapshot.charCount;
+      await saveReviewerState(state);
+      await refreshToolbarButton(true);
+      await api.v1.ui.toast("Lorebook review armed. Waiting for the next *** scene break.", {
+        type: "info",
+      });
+      return;
+    }
+
+    if (!force && state.pendingSceneBreak && !(await hasSceneBreakSince(state.pendingSceneBreakCharCount))) {
+      await saveReviewerState(state);
+      return;
+    }
+
+    await api.v1.ui.toast(`Lorebook Growth Reviewer is checking lorebooks after ${wordsSinceLastCheck} new words...`, {
+      type: "info",
+    });
+
+    const collectionResult = await collectLorebookSuggestions(
+      excerptTargetWords,
+      state.reviewCursorEntryId,
+      autoAcceptEnabled,
+      autoAcceptEnabled,
+    );
+    const suggestions = collectionResult.suggestions;
+    state.lastAutoCheckWordCount = currentWordCount;
+    state.reviewCursorEntryId = collectionResult.lastProcessedEntryId;
+    state.pendingSceneBreak = false;
+    state.pendingSceneBreakCharCount = undefined;
+    await saveReviewerState(state);
+    await refreshToolbarButton(false);
+
+    if (autoAcceptEnabled) {
+      if (collectionResult.appliedCount > 0) {
+        await showCompletionModal(
+          `Lorebook Growth Reviewer finished this ${trigger}: auto-accepted ${collectionResult.appliedCount} ${collectionResult.appliedCount === 1 ? "entry" : "entries"}.`,
+        );
+        return;
+      }
+
+      await showCompletionModal(
+        `Lorebook Growth Reviewer finished this ${trigger} with no new lore updates to auto-accept.`,
+      );
+      return;
+    }
+
+    if (suggestions.length === 0) {
+      await showCompletionModal(`Lorebook Growth Reviewer found no new lore updates after this ${trigger}.`);
+      return;
+    }
+
+    await showSuggestionsModal(suggestions, currentWordCount, intervalWords);
+  } catch (error) {
+    api.v1.error("Lorebook Growth Reviewer failed:", error);
+    await api.v1.ui.toast("Lorebook Growth Reviewer failed. Check the script log for details.", {
+      type: "error",
+    });
+  } finally {
+    isReviewRunning = false;
+    reviewProgress = undefined;
+  }
+}
+
+async function showStatusModal(): Promise<void> {
+  const storedState = await readStoredReviewerState();
+  const previousSummaries = Array.isArray(storedState?.sectionSummaries) ? storedState.sectionSummaries : undefined;
+  const currentWordCount = (await getStorySnapshot(previousSummaries)).wordCount;
+  const state = await loadReviewerState(currentWordCount);
+  const intervalWords = await getConfiguredIntervalWords();
+  const wordsSinceLastCheck = Math.max(0, currentWordCount - state.lastAutoCheckWordCount);
+  const nextCheckIn = Math.max(0, intervalWords - wordsSinceLastCheck);
+  const autoAcceptEnabled = await loadAutoAcceptEnabled();
+  const inProgressText = getReviewProgressText();
+
+  await api.v1.ui.modal.open({
+    title: "Lorebook Growth Reviewer",
+    size: "small",
+    content: [
+      {
+        type: "text",
+        text:
+          `Story length: ${currentWordCount} words\n` +
+          `Last auto-check at: ${state.lastAutoCheckWordCount} words\n` +
+          `Current interval: ${intervalWords} words\n` +
+          `Next auto-check in: ${nextCheckIn} words\n` +
+          `Review cursor: ${state.reviewCursorEntryId ?? "Start of list"}\n` +
+          `Scene-break trigger armed: ${state.pendingSceneBreak === true ? "Yes" : "No"}\n\n` +
+          inProgressText,
+      },
+      {
+        type: "button",
+        text: "Run Review Now",
+        callback: async () => {
+          await api.v1.ui.toast("Starting lorebook review...", {
+            type: "info",
+          });
+          await runLorebookReview("manual run", true);
+        },
+      },
+      {
+        type: "button",
+        text: "Reset Baseline",
+        callback: async () => {
+          await resetAutoCheckBaseline();
+        },
+      },
+      {
+        type: "button",
+        text: "Manage Entry Overrides",
+        callback: async () => {
+          await showOverridesModal();
+        },
+      },
+      {
+        type: "button",
+        text: `Auto-Accept Entries: ${autoAcceptEnabled ? "ON" : "OFF"}`,
+        callback: async () => {
+          await toggleAutoAccept();
+        },
+      },
+      {
+        type: "text",
+        text: "Set review interval:",
+      },
+      {
+        type: "button",
+        text: "1000 Words",
+        callback: async () => {
+          await saveIntervalAndToast(1000);
+        },
+      },
+      {
+        type: "button",
+        text: "2000 Words",
+        callback: async () => {
+          await saveIntervalAndToast(2000);
+        },
+      },
+      {
+        type: "button",
+        text: "5000 Words",
+        callback: async () => {
+          await saveIntervalAndToast(5000);
+        },
+      },
+    ],
+  });
+}
+
+api.v1.hooks.register("onScriptsLoaded", async () => {
+  try {
+    const storedState = await readStoredReviewerState();
+    const previousSummaries = Array.isArray(storedState?.sectionSummaries) ? storedState.sectionSummaries : undefined;
+    const snapshot = await getStorySnapshot(previousSummaries);
+    const state = await loadReviewerState(snapshot.wordCount, storedState);
+    state.lastKnownWordCount = snapshot.wordCount;
+    state.sectionSummaries = snapshot.sectionSummaries;
+    await saveReviewerState(state);
+    await refreshToolbarButton(state.pendingSceneBreak === true);
+  } catch (error) {
+    api.v1.error("Lorebook Growth Reviewer startup failed:", error);
+    await api.v1.ui.toast("Lorebook Growth Reviewer failed during startup. Check the script log.", {
+      type: "error",
+    });
+  }
+});
+
+api.v1.hooks.register("onGenerationEnd", async ({ inlineGeneration }) => {
+  if (inlineGeneration) {
+    return;
+  }
+
+  await runLorebookReview("generation");
+});
+
+api.v1.hooks.register("onHistoryNavigated", async () => {
+  try {
+    const snapshot = await getStorySnapshot();
+    const state = await loadReviewerState(snapshot.wordCount);
+    state.lastKnownWordCount = snapshot.wordCount;
+    state.sectionSummaries = snapshot.sectionSummaries;
+    if (state.lastAutoCheckWordCount > snapshot.wordCount) {
+      state.lastAutoCheckWordCount = snapshot.wordCount;
+    }
+    await saveReviewerState(state);
+  } catch (error) {
+    api.v1.error("Lorebook Growth Reviewer failed to resync after history navigation:", error);
+  }
+});
+
+api.v1.log("Lorebook Growth Reviewer initialized");
