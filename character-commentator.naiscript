@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1776512982753
-version: 2.7.3
+version: 2.7.4
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -180,14 +180,59 @@ async function copyAvatarBridgeInstallLink() {
   }
 }
 
+async function describeCharacterAppearance(character) {
+  const source = String(character.text || "")
+    .replace(/data:image\/[^;]+;base64,[^\s]+/g, "")
+    .slice(0, 6000);
+  if (!source.trim()) return "";
+
+  const selectedModel = await api.v1.config.get("generationModel");
+  const response = await api.v1.generate(
+    [
+      {
+        role: "system",
+        content: "Extract a concise visual appearance description for an image generator from the character information. Include only visible traits such as age presentation, body/build, skin, face, hair, eyes, clothing, accessories, and distinctive features. Do not include personality, backstory, relationships, actions, dialogue, scene details, or instructions. Do not invent specifics; omit unknown traits. Return only a compact comma-separated description, at most 80 words."
+      },
+      {
+        role: "user",
+        content: `Character name: ${character.name}\nCharacter lorebook entry:\n${source}`
+      }
+    ],
+    { model: selectedModel, max_tokens: 120, temperature: 0.2 },
+    undefined,
+    "background"
+  );
+
+  return String(response.choices?.[0]?.text || "")
+    .replace(/^\s*["'`]+|["'`]+\s*$/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .slice(0, 80)
+    .join(" ");
+}
+
 async function generateCharacterAvatar(character) {
   if (!(await connectAvatarBridge())) {
     await api.v1.ui.toast("Character Engine Bridge is not connected; keeping the default avatar.", { type: "warning" });
     return null;
   }
 
+  let appearance;
+  try {
+    await api.v1.ui.toast(`Summarizing ${character.name}'s appearance…`, { type: "info" });
+    appearance = await describeCharacterAppearance(character);
+  } catch (error) {
+    api.v1.error("Could not summarize character appearance:", error);
+    await api.v1.ui.toast(`Could not determine ${character.name}'s appearance; keeping the default avatar.`, { type: "warning" });
+    return null;
+  }
+  if (!appearance) {
+    await api.v1.ui.toast(`No visual details found for ${character.name}; keeping the default avatar.`, { type: "warning" });
+    return null;
+  }
+
   const requestId = api.v1.uuid();
-  const lore = String(character.text || "").replace(/data:image\/[^;]+;base64,[^\s]+/g, "").slice(0, 2200);
   const resultPromise = new Promise(resolve => {
     pendingAvatarGenerations.set(requestId, resolve);
     api.v1.timers.setTimeout(() => {
@@ -208,7 +253,7 @@ async function generateCharacterAvatar(character) {
         prompt: "anime portrait, head and shoulders, looking at viewer, simple background",
         extraBaseVisuals: "best quality, very aesthetic, detailed character portrait",
         extraBaseUC: "lowres, worst quality, bad anatomy, bad hands, text, watermark",
-        characters: [{ name: character.name, visuals: lore, uc: "" }],
+        characters: [{ name: character.name, visuals: appearance, uc: "" }],
         settings: {
           model: "nai-diffusion-4-5-full", width: 832, height: 1216,
           scale: 5, steps: 28, seed: 0, quality: "best quality",
