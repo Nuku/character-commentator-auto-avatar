@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1776512982753
-version: 2.8.3
+version: 2.8.4
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -111,7 +111,7 @@ const DEFAULT_AVATAR_STORAGE_KEY = "character-commentator-default-avatar";
 const SOLO_SPEAKER_STORAGE_KEY = "character-commentator-solo-speaker";
 const AVATAR_BRIDGE_RESULT_EVENT = "CC_AVATAR_GENERATION_RESULT";
 const AVATAR_BRIDGE_TIMEOUT_MS = 240000;
-const AVATAR_BRIDGE_INSTALL_URL = "https://github.com/Nuku/character-commentator-auto-avatar/blob/main/Bridge.js";
+const AVATAR_BRIDGE_INSTALL_URL = "https://raw.githubusercontent.com/Nuku/character-commentator-auto-avatar/main/Bridge.user.js";
 let avatarBridgeSubscribed = false;
 let avatarBridgeReady = false;
 let avatarBridgeMissing = false;
@@ -178,10 +178,10 @@ async function connectAvatarBridge() {
 async function copyAvatarBridgeInstallLink() {
   try {
     await api.v1.clipboard.writeText(AVATAR_BRIDGE_INSTALL_URL);
-    await api.v1.ui.toast("Bridge page link copied. Paste it into your browser to open the script.", { type: "success" });
+    await api.v1.ui.toast("Bridge install link copied. Open it in your browser to install the userscript.", { type: "success" });
   } catch (error) {
-    api.v1.error("Could not copy the bridge page link:", error);
-    await api.v1.ui.toast(`Open this bridge page: ${AVATAR_BRIDGE_INSTALL_URL}`, { type: "warning" });
+    api.v1.error("Could not copy the bridge install link:", error);
+    await api.v1.ui.toast(`Open this bridge install link: ${AVATAR_BRIDGE_INSTALL_URL}`, { type: "warning" });
   }
 }
 
@@ -1688,7 +1688,7 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
               }
             }, ...(avatarBridgeMissing ? [{
               type: "button",
-              text: "Copy Bridge Link",
+              text: "Copy Bridge Install Link",
               iconId: "external-link",
               style: { fontSize: '12px', marginBottom: '0' },
               callback: copyAvatarBridgeInstallLink

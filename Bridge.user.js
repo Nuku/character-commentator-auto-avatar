@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Character Engine — Bridge v3.0.38 (Commentator avatar reply)
+// @name         Character Engine — Bridge v3.0.39 (Commentator avatar reply)
 // @namespace    Violentmonkey Scripts
-// @version      3.0.38
+// @version      3.0.39
 // @description  CE bridge: image generation, storage, painters, generation indicator
 // @match        https://novelai.net/*
 // @license      MIT
@@ -9,8 +9,8 @@
 // @inject-into  page
 // @sandbox      raw
 // @grant        none
-// @downloadURL https://update.greasyfork.org/scripts/587717/Character%20Engine%20%E2%80%94%20Bridge%20v3036.user.js
-// @updateURL https://update.greasyfork.org/scripts/587717/Character%20Engine%20%E2%80%94%20Bridge%20v3036.meta.js
+// @downloadURL https://raw.githubusercontent.com/Nuku/character-commentator-auto-avatar/main/Bridge.user.js
+// @updateURL https://raw.githubusercontent.com/Nuku/character-commentator-auto-avatar/main/Bridge.user.js
 // ==/UserScript==
 
 // CE-INDEX (bridge). Shared by Character Engine (CE) and CharacterRoom (CR). [CR-*] tags mark
