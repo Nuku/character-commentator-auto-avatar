@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1776512982753
-version: 2.7.8
+version: 2.8.1
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -222,32 +222,44 @@ async function describeCharacterAppearance(character) {
   };
 }
 
-async function saveCharacterAppearanceToLorebook(character, description) {
+async function saveCharacterAppearanceToLorebook(character, description, appearanceForm) {
   if (!(await api.v1.permissions.request("lorebookEdit"))) return false;
 
   const entries = await api.v1.lorebook.entries();
   const entry = entries.find(item => item.id === character.id);
   if (!entry) return false;
 
-  const lines = String(entry.text || "").split(/\r?\n/);
-  const updatedLines = [];
-  let replaced = false;
-  for (const line of lines) {
-    if (/^\s*Appearance\s*:/i.test(line)) {
-      if (!replaced) {
-        updatedLines.push(`Appearance: ${description}`);
-        replaced = true;
-      }
-    } else {
-      updatedLines.push(line);
-    }
-  }
-  if (!replaced) updatedLines.push(`Appearance: ${description}`);
+  const lines = String(entry.text || "").split(/\r?\n/)
+    .filter(line => !/^\s*Appearance(?: Form)?\s*:/i.test(line));
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  if (lines.length) lines.push("");
+  lines.push(`Appearance: ${description}`);
+  lines.push(`Appearance Form: ${appearanceForm}`);
 
   await api.v1.lorebook.updateEntry(entry.id, {
-    text: updatedLines.join("\n")
+    text: lines.join("\n")
   });
+  character.generatedAppearance = {
+    description,
+    isNonHumanoid: /^NON/i.test(appearanceForm)
+  };
   return true;
+}
+
+function getSavedCharacterAppearance(character) {
+  if (character.generatedAppearance) return character.generatedAppearance;
+
+  const lines = String(character.text || "").split(/\r?\n/);
+  const description = lines.find(line => /^\s*Appearance\s*:/i.test(line))
+    ?.replace(/^\s*Appearance\s*:/i, "").trim();
+  if (!description) return null;
+
+  const formLine = lines.find(line => /^\s*Appearance Form\s*:/i.test(line));
+  const form = formLine?.replace(/^\s*Appearance Form\s*:/i, "").trim();
+  return {
+    description,
+    isNonHumanoid: /^NON[- ]?HUMAN$/i.test(form || "")
+  };
 }
 
 async function generateCharacterAvatar(character) {
@@ -271,7 +283,7 @@ async function generateCharacterAvatar(character) {
   }
   api.v1.log(`[Character Avatar Appearance] ${character.name}: ${appearance.description}`);
   try {
-    if (await saveCharacterAppearanceToLorebook(character, appearance.description)) {
+    if (await saveCharacterAppearanceToLorebook(character, appearance.description, appearance.isNonHumanoid ? "NONHUMAN" : "HUMANOID")) {
       await api.v1.ui.toast(`Appearance summary saved to ${character.name}'s Lorebook entry.`, { type: "success" });
     } else {
       await api.v1.ui.toast(`Appearance summary for ${character.name} is in the script log; Lorebook edit permission was not granted.`, { type: "warning" });
@@ -1524,6 +1536,7 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
     const hasCharacterSpecificAvatar = !!characterAvatarImage;
     const soloSpeakerName = await getSoloSpeakerName();
     const isSoloSpeaker = !!soloSpeakerName && soloSpeakerName.toLowerCase() === selectedCharacter.name.toLowerCase();
+    const savedAppearance = getSavedCharacterAppearance(selectedCharacter);
     let imageData = characterAvatarImage;
     if (!imageData) {
       imageData = await getDefaultAvatarImage();
@@ -1698,6 +1711,21 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
                 }
               }
             }]),
+            ...(savedAppearance ? [{
+              type: "button",
+              text: "Retry Avatar",
+              iconId: "refresh-cw",
+              style: { fontSize: '12px', marginBottom: '0' },
+              callback: async () => {
+                try {
+                  const image = await generateCharacterAvatar(selectedCharacter);
+                  if (image) await api.v1.commentBot.update({ image });
+                } catch (error) {
+                  api.v1.error("Could not retry character avatar generation:", error);
+                  await api.v1.ui.toast(`Could not generate an avatar for ${selectedCharacter.name}.`, { type: "warning" });
+                }
+              }
+            }] : []),
             {
               type: "button",
               text: isSoloSpeaker ? "Random Speakers" : "Only This Character",

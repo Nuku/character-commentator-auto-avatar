@@ -4,7 +4,7 @@ NovelAI `.naiscript` tools developed in this workspace.
 
 ## Scripts
 
-- [Character Commentator](character-commentator.naiscript) — lets Lorebook characters comment on story events. Version 2.7.8 can generate and save missing character portraits when the Character Engine Bridge is installed, using NovelAI's `fur dataset` prompt tag for non-humanoid characters. GLM-4-6 creates visual summaries that are saved as an `Appearance:` line in each character's Lorebook entry. The `Automatically Generate Missing Avatars` setting defaults on and disables appearance analysis, image generation, and summary saving when switched off.
+- [Character Commentator](character-commentator.naiscript) — lets Lorebook characters comment on story events. Version 2.8.1 can generate and save missing character portraits when the Character Engine Bridge is installed, using NovelAI's `fur dataset` prompt tag for non-humanoid characters. GLM-4-6 creates visual summaries that are saved as `Appearance:` and `Appearance Form:` lines in each character's Lorebook entry. The `Automatically Generate Missing Avatars` setting defaults on and disables appearance analysis, image generation, and summary saving when switched off. A `Retry Avatar` button appears when an appearance summary exists; it runs a fresh summary and image generation pass.
 - [Lorebook Growth Reviewer](Lorebook_Growth_Reviewer.naiscript) — reviews Lorebook entries for newly established facts and proposes updates after enough new words are added. Version 1.7.0.
 - [Prose Coach](Prose_Coach.naiscript) — provides focused writing coaching for show-don't-tell, action tags, and selected text. Version 1.6.61.
 - [Word Spellcheck Helper](Word_Spellcheck.naiscript) — checks a selected word and suggests alternatives. Version 1.0.1.
