@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1776512982753
-version: 2.8.5
+version: 2.8.6
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -187,7 +187,7 @@ async function copyAvatarBridgeInstallLink() {
 
 async function describeCharacterAppearance(character) {
   const source = String(character.text || "")
-    .replace(/^\s*Appearance\s*:[^\r\n]*/gim, "")
+    .replace(/^\s*Appearance(?: Form)?\s*:[^\r\n]*/gim, "")
     .replace(/data:image\/[^;]+;base64,[^\s]+/g, "")
     .slice(0, 6000);
   if (!source.trim()) return "";
@@ -196,14 +196,14 @@ async function describeCharacterAppearance(character) {
     [
       {
         role: "system",
-        content: "Analyze the character information for an avatar. First classify the character's BODY PLAN: HUMANOID for a human-like upright body plan (including elves, merfolk, and anthropomorphic animal people); NONHUMAN for a primarily animal or creature body plan (such as ordinary animals, quadrupeds, serpents, or monsters). When unclear, choose HUMANOID. Then describe only visible traits useful for drawing: species/body plan, age presentation, build, skin/fur/scales/feathers, face or muzzle, hair/crest, eyes, clothing, accessories, and distinctive features. Write the appearance as natural, flowing prose in one or two complete sentences, not a list of attributes or comma-separated tags. Do not include personality, backstory, relationships, actions, dialogue, scene details, or instructions. Do not invent specifics; omit unknown traits. Keep the description at or below 80 words. Return exactly two lines: FORM: HUMANOID or FORM: NONHUMAN; then APPEARANCE: followed by the prose description."
+        content: "Analyze the character information for an avatar and describe the character's CURRENT physical form. Treat explicit current transformation statements and Body/Species fields as the strongest evidence. Preserve the exact name of a named transformed form or identity in the appearance prose (for example, 'currently appears as Trixie Lulamoon'); do not replace it with a generic human description. Prefer current transformation and Body/Species fields, then dedicated Hair/Eyes/Skin/Clothes fields, over generic Attributes when details conflict. Classify HUMAN or humanlike non-animal species (such as humans, elves, or dwarves) as HUMANOID. Classify animal- or creature-derived species as NONHUMAN, including anthropomorphic ponies, canines, foxes, and other upright/bipedal animal people; posture does not make an animal species humanoid for this classification. When unclear, choose HUMANOID. Write one or two complete, natural prose sentences describing the current visible form and useful drawing details: species, named form, body shape/posture, build, skin/fur/scales/feathers, face or muzzle, mane/hair, eyes, clothing, accessories, and distinctive features. Do not list attributes or comma-separated tags. Use transformation history only to identify the current form; omit unrelated personality, backstory, relationships, actions, dialogue, scenes, and instructions. Do not invent specifics or assume franchise details that conflict with the entry. Keep the description at or below 80 words. Return exactly two lines: FORM: HUMANOID or FORM: NONHUMAN; then APPEARANCE: followed by the prose description."
       },
       {
         role: "user",
         content: `Character name: ${character.name}\nCharacter lorebook entry:\n${source}`
       }
     ],
-    { model: "glm-4-6", max_tokens: 120, temperature: 0.2 },
+    { model: "glm-4-6", max_tokens: 180, temperature: 0.2 },
     undefined,
     "background"
   );
