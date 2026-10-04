@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Character Engine — Bridge v3.0.37 (Commentator avatar reply)
+// @name         Character Engine — Bridge v3.0.38 (Commentator avatar reply)
 // @namespace    Violentmonkey Scripts
-// @version      3.0.37
+// @version      3.0.38
 // @description  CE bridge: image generation, storage, painters, generation indicator
 // @match        https://novelai.net/*
 // @license      MIT
@@ -853,7 +853,7 @@ function buildRequestBody(fp, fu, chars, settings) {
         if (c.visuals && c.visuals.trim()) { charPos.push({ char_caption: c.visuals, centers: [{ x: 0.5, y: 0.5 }] }); charNeg.push({ char_caption: c.uc || '', centers: [{ x: 0.5, y: 0.5 }] }); }
     });
     var seed = settings.seed && settings.seed !== 0 ? settings.seed : Math.floor(Math.random() * 4294967295);
-    var naiModel = (settings && settings.model) ? String(settings.model) : 'nai-diffusion-4-5-full';
+    var naiModel = (settings && settings.model) ? String(settings.model) : 'nai-diffusion-5-full';
     return {
         input: fp, model: naiModel, action: 'generate',
         parameters: {

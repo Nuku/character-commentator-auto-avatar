@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1776512982753
-version: 2.8.2
+version: 2.8.3
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -316,7 +316,7 @@ async function generateCharacterAvatar(character) {
         extraBaseUC: "lowres, worst quality, bad anatomy, bad hands, text, watermark",
         characters: [{ name: character.name, visuals: appearance.description, uc: "" }],
         settings: {
-          model: "nai-diffusion-4-5-full", width: 832, height: 1216,
+          model: "nai-diffusion-5-full", width: 832, height: 1216,
           scale: 5, steps: 28, seed: 0, quality: "best quality",
           negative: "lowres, worst quality, bad anatomy, bad hands, text, watermark"
         }
