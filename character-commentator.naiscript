@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1776512982753
-version: 2.7.7
+version: 2.7.8
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -54,6 +54,11 @@ config:
     type: string
     default: ""
     description: "Avatar image for all character comments (leave empty for default HypeBot avatar). Must be a base64 data URI starting with 'data:image/' - convert images at: https://www.base64-image.de/"
+  - name: autoGenerateMissingAvatars
+    prettyName: Automatically Generate Missing Avatars
+    type: boolean
+    default: true
+    description: "When enabled, summarizes appearance, generates missing character avatars through the bridge, and saves the appearance summary. Disable to skip all three."
   - name: avatarLorebookName
     prettyName: Avatar Lorebook Name
     type: string
@@ -1508,7 +1513,7 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
     
     // Get avatar: try avatar lorebook first, then fall back to default setting
     let characterAvatarImage = await getAvatarFromLorebook(selectedCharacter.name);
-    if (!characterAvatarImage) {
+    if (!characterAvatarImage && await api.v1.config.get("autoGenerateMissingAvatars")) {
       try {
         characterAvatarImage = await generateCharacterAvatar(selectedCharacter);
       } catch (error) {
