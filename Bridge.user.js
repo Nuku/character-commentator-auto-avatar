@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Character Engine — Bridge v3.0.39 (Commentator avatar reply)
+// @name         Character Engine — Bridge v3.0.40 (Commentator avatar reply)
 // @namespace    Violentmonkey Scripts
-// @version      3.0.39
+// @version      3.0.40
 // @description  CE bridge: image generation, storage, painters, generation indicator
 // @match        https://novelai.net/*
 // @license      MIT
@@ -276,6 +276,9 @@ function sendToEngine(event, data) {
 var _ceVpLastW = -1, _ceVpLastH = -1, _ceVpTimer = null;
 function _ceViewportSend() {
     try {
+        // UI resizes can happen before the engine handshake (for example when a
+        // sidebar coach expands). Do not emit a transport warning in that window.
+        if (!NAITMBridge || !engineScriptId) return;
         var w = Math.round(window.innerWidth || 0);
         var h = Math.round(window.innerHeight || 0);
         if (!w) return;
