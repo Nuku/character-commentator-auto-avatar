@@ -535,6 +535,19 @@ function parseMarkdown(text, baseStyle = {}) {
 }
 
 /**
+ * Compare full character names while allowing a single-token first-name alias.
+ * This keeps "Pinkie" and "Pinkie Pie" linked without matching partial names.
+ */
+function avatarNamesMatch(left, right) {
+  const normalize = value => String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+  const a = normalize(left);
+  const b = normalize(right);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  return (!a.includes(" ") && b.startsWith(`${a} `)) || (!b.includes(" ") && a.startsWith(`${b} `));
+}
+
+/**
  * Get avatar for a character from the avatar lorebook
  * @param characterName The name of the character
  * @returns base64 data URI or null if not found
@@ -548,9 +561,8 @@ async function getAvatarFromLorebook(characterName) {
     }
     
     // Parse the avatar lorebook text for "Name: base64data" lines
-    const lines = avatarLorebook.text.split('\n');
-    const fullNameLower = characterName.toLowerCase();
-    const firstNameLower = characterName.includes(' ') ? characterName.split(' ')[0].toLowerCase() : null;
+    const lines = avatarLorebook.text.split(/\r?\n/);
+    let aliasMatch = null;
     
     for (const line of lines) {
       const colonIndex = line.indexOf(':');
@@ -559,16 +571,12 @@ async function getAvatarFromLorebook(characterName) {
       const namePart = line.substring(0, colonIndex).trim().toLowerCase();
       const dataPart = line.substring(colonIndex + 1).trim();
       
-      // Check for exact match or first name match
-      if (namePart === fullNameLower || (firstNameLower && namePart === firstNameLower)) {
-        // Validate it's a base64 data URI
-        if (dataPart.startsWith('data:image/')) {
-          return dataPart;
-        }
-      }
+      if (!dataPart.startsWith('data:image/') || !avatarNamesMatch(namePart, characterName)) continue;
+      // Prefer an exact label if both an exact and an alias row exist.
+      if (namePart === characterName.trim().toLowerCase()) return dataPart;
+      if (!aliasMatch) aliasMatch = dataPart;
     }
-    
-    return null;
+    return aliasMatch;
   } catch (error) {
     // Silently fail if we can't access the avatar lorebook
     return null;
@@ -605,8 +613,7 @@ async function saveCharacterAvatarToLorebook(characterName, imageData) {
   }
 
   const { lorebookName, entry } = await getAvatarLorebookEntry();
-  const normalizedName = characterName.trim().toLowerCase();
-  const existingLines = entry && entry.text ? entry.text.split('\n') : [];
+  const existingLines = entry && entry.text ? entry.text.split(/\r?\n/) : [];
   let replaced = false;
   
   const updatedLines = existingLines.map(line => {
@@ -616,7 +623,9 @@ async function saveCharacterAvatarToLorebook(characterName, imageData) {
     }
     
     const namePart = line.substring(0, colonIndex).trim().toLowerCase();
-    if (namePart === normalizedName) {
+    const dataPart = line.substring(colonIndex + 1).trim();
+    if (dataPart.startsWith('data:image/') && avatarNamesMatch(namePart, characterName)) {
+      if (replaced) return null;
       replaced = true;
       return `${characterName}: ${imageData}`;
     }
@@ -628,7 +637,7 @@ async function saveCharacterAvatarToLorebook(characterName, imageData) {
     updatedLines.push(`${characterName}: ${imageData}`);
   }
   
-  const newText = updatedLines.filter(line => line.trim().length > 0).join('\n');
+  const newText = updatedLines.filter(line => line && line.trim().length > 0).join('\n');
   
   if (entry) {
     await api.v1.lorebook.updateEntry(entry.id, { text: newText });
