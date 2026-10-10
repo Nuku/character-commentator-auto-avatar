@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1776512982753
-version: 2.10.3
+version: 2.10.4
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -260,12 +260,11 @@ function getSavedCharacterAppearance(character) {
   const lines = String(character.text || "").split(/\r?\n/);
   const description = lines.find(line => /^\s*Appearance\s*:/i.test(line))
     ?.replace(/^\s*Appearance\s*:/i, "").trim();
-  if (!description) return null;
-
   const formLine = lines.find(line => /^\s*Appearance Form\s*:/i.test(line));
+  if (!description && !formLine) return null;
   const form = formLine?.replace(/^\s*Appearance Form\s*:/i, "").trim();
   return {
-    description,
+    description: description || "",
     isNonHumanoid: /^NON[- ]?HUMAN$/i.test(form || "")
   };
 }
@@ -382,7 +381,7 @@ async function generateEmotionAvatar(character, baseImage, comment) {
   const characterVisuals = [appearance?.description, storyStyle, expressions[emotion]].filter(Boolean).join(" ");
   const result = await requestAvatarImage({
     kind: "commentatorExpression", temporary: true, preciseReferenceImage: baseImage,
-    prompt: `${storyStyle ? `${storyStyle} ` : ""}Solo character, centered upper-body portrait, entire head and shoulders visible, looking toward viewer, simple background. Preserve the reference character's identity, species, facial features, hair, colors, clothing and art style. Change the facial expression to: ${expressions[emotion]}.`,
+    prompt: `${storyStyle ? `${storyStyle} ` : ""}${appearance?.isNonHumanoid ? "fur dataset, " : ""}Solo character, centered upper-body portrait, entire head and shoulders visible, looking toward viewer, simple background. Preserve the reference character's identity, species, facial features, hair, colors, clothing and art style. Change the facial expression to: ${expressions[emotion]}.`,
     characters: [{ name: character.name, visuals: characterVisuals, uc: "" }],
     settings: {
       model: "nai-diffusion-4-5-full", width: 832, height: 1216,
