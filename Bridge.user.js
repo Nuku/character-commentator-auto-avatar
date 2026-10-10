@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Character Engine — Bridge v3.0.42 (Temporary commentator expressions)
+// @name         Character Engine — Bridge v3.0.43 (Temporary commentator expressions)
 // @namespace    Violentmonkey Scripts
-// @version      3.0.42
+// @version      3.0.43
 // @description  CE bridge: image generation, storage, painters, generation indicator
 // @match        https://novelai.net/*
 // @license      MIT
@@ -907,7 +907,7 @@ async function generateCommentImage(imagePayload) {
         body.parameters.director_reference_images = [await preparePreciseReference(imagePayload.preciseReferenceImage)];
         body.parameters.director_reference_descriptions = [{ caption: { base_caption: 'character&style', char_captions: [] }, legacy_uc: false }];
         body.parameters.director_reference_information_extracted = [1];
-        body.parameters.director_reference_strength_values = [0.75];
+        body.parameters.director_reference_strength_values = [1];
         body.parameters.director_reference_secondary_strength_values = [1];
     }
     var dataUrl = await callGenerateAPI(body);
