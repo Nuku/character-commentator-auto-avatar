@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1776512982753
-version: 2.10.1
+version: 2.10.2
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -1895,7 +1895,7 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
         }
       ];
 
-    await api.v1.commentBot.update({
+    const speakingView = {
       name: "", // Empty - we'll show name in content instead
       state: "speaking",
       visible: autoShow,
@@ -1904,14 +1904,15 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
       callback: async () => {
         await generateAndShowComment(true); // Skip chance check on manual click
       }
-    });
+    };
+    await api.v1.commentBot.update(speakingView);
 
     // Expressions always use the saved original and remain only in the current UI.
     try {
       const expressionImage = await generateEmotionAvatar(selectedCharacter, expressionBaseImage, comment);
       if (expressionImage && currentChatCharacter === selectedCharacter.name &&
           await getAvatarFromLorebook(selectedCharacter.name, selectedCharacter.displayName) === expressionBaseImage) {
-        await api.v1.commentBot.update({ image: expressionImage });
+        await api.v1.commentBot.update({ ...speakingView, image: expressionImage });
       }
     } catch (error) {
       api.v1.error("Could not generate temporary character expression:", error);
