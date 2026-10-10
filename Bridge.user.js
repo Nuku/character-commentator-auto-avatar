@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Character Engine — Bridge v3.0.40 (Commentator avatar reply)
+// @name         Character Engine — Bridge v3.0.42 (Temporary commentator expressions)
 // @namespace    Violentmonkey Scripts
-// @version      3.0.40
+// @version      3.0.42
 // @description  CE bridge: image generation, storage, painters, generation indicator
 // @match        https://novelai.net/*
 // @license      MIT
@@ -311,7 +311,7 @@ function handleEngineMessage(payload, meta) {
             console.log('[CE Bridge] Engine handshake received. Sending ACK. SID:', engineScriptId,
                 '| Engine:', engineKind, (payload && payload.engineVersion) || '');
             // [CR-CCAV-HOSTCLEAR] ccavClear tells CR a portrait box clears the float above it.
-            sendToEngine('HANDSHAKE_ACK', { engine: engineKind, crAware: true, ccavClear: true });
+            sendToEngine('HANDSHAKE_ACK', { engine: engineKind, crAware: true, ccavClear: true, temporaryPreciseReference: true });
             _ceVpLastW = -1; _ceVpLastH = -1;
             _ceViewportSend();
             break;
@@ -330,15 +330,15 @@ function handleEngineMessage(payload, meta) {
                         }
                         return;
                     }
-                    displayGeneratedImage(p.uuid, dataUrl, p);
+                    if (!p.temporary) displayGeneratedImage(p.uuid, dataUrl, p);
                     _ccimgInvalidate(); _ceStoryImgNudge();
                     _ceSurfImgInvalidate();
-                    if (p.kind === 'snapshot' && p.charId) {
+                    if (!p.temporary && p.kind === 'snapshot' && p.charId) {
                         _ceSurfImgInvalidate();
                         _savePortrait(p.charId + '_em_Snapshot', dataUrl, 'gen', { fp: p.prompt || '', fu: (p.characters && p.characters[0] && p.characters[0].uc) || '', chars: p.characters || [], settings: p.settings || null }).catch(function() {});
                         _showToast('Snapshot image saved.');
                     }
-                    if (p.kind === 'charSlot' && p.charId && p.slot) {
+                    if (!p.temporary && p.kind === 'charSlot' && p.charId && p.slot) {
                         _ceSurfImgInvalidate();
                         var _cisKey = p.charId + '_em_' + p.slot;
                         _savePortrait(_cisKey, dataUrl, 'gen', { fp: p.prompt || '', fu: (p.characters && p.characters[0] && p.characters[0].uc) || '', chars: p.characters || [], settings: p.settings || null }).catch(function() {});
@@ -871,13 +871,50 @@ function buildRequestBody(fp, fu, chars, settings) {
     };
 }
 
+async function preparePreciseReference(dataUrl) {
+    if (!/^data:image\/[^;]+;base64,/.test(dataUrl)) throw new Error('Precise Reference requires a base64 image.');
+    var image = new Image();
+    await new Promise(function(resolve, reject) {
+        image.onload = resolve;
+        image.onerror = function() { reject(new Error('Could not decode the avatar reference.')); };
+        image.src = dataUrl;
+    });
+    var sizes = [[1024, 1536], [1472, 1472], [1536, 1024]];
+    var ratio = image.naturalWidth / image.naturalHeight;
+    sizes.sort(function(a, b) {
+        return Math.abs(Math.log(ratio / (a[0] / a[1]))) - Math.abs(Math.log(ratio / (b[0] / b[1])));
+    });
+    var canvas = document.createElement('canvas');
+    canvas.width = sizes[0][0]; canvas.height = sizes[0][1];
+    var context = canvas.getContext('2d');
+    if (!context) throw new Error('Could not prepare the avatar reference.');
+    context.fillStyle = '#000'; context.fillRect(0, 0, canvas.width, canvas.height);
+    var scale = Math.min(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight);
+    var width = Math.round(image.naturalWidth * scale), height = Math.round(image.naturalHeight * scale);
+    context.drawImage(image, Math.floor((canvas.width - width) / 2), Math.floor((canvas.height - height) / 2), width, height);
+    return canvas.toDataURL('image/png').split(',')[1];
+}
+
 async function generateCommentImage(imagePayload) {
     var fp = [imagePayload.settings.quality, imagePayload.extraBaseVisuals, imagePayload.prompt].filter(Boolean).join(', ');
     var fu = [imagePayload.settings.negative, imagePayload.extraBaseUC].filter(Boolean).join(', ');
     var body = buildRequestBody(fp, fu, imagePayload.characters || [], imagePayload.settings);
+    if (imagePayload.kind === 'commentatorExpression' && (!imagePayload.temporary || !imagePayload.preciseReferenceImage)) {
+        throw new Error('Expression portraits require a temporary request and a saved avatar reference.');
+    }
+    if (imagePayload.preciseReferenceImage) {
+        if (body.model !== 'nai-diffusion-4-5-full') throw new Error('Avatar Precise Reference requires V4.5 Full.');
+        body.parameters.director_reference_images = [await preparePreciseReference(imagePayload.preciseReferenceImage)];
+        body.parameters.director_reference_descriptions = [{ caption: { base_caption: 'character&style', char_captions: [] }, legacy_uc: false }];
+        body.parameters.director_reference_information_extracted = [1];
+        body.parameters.director_reference_strength_values = [0.75];
+        body.parameters.director_reference_secondary_strength_values = [1];
+    }
     var dataUrl = await callGenerateAPI(body);
-    dbSave(imagePayload.uuid, imagePayload.prompt, dataUrl, fp, fu, imagePayload.characters || [], imagePayload.settings, { header: imagePayload.header || '', body: imagePayload.body || '' }, imagePayload.storyId || '').catch(function() {});
-    imgCache.set(imagePayload.uuid, { dataUrl: dataUrl, fp: fp, fu: fu, prompt: imagePayload.prompt, characters: imagePayload.characters || [], settings: imagePayload.settings });
+    if (!imagePayload.temporary) {
+        dbSave(imagePayload.uuid, imagePayload.prompt, dataUrl, fp, fu, imagePayload.characters || [], imagePayload.settings, { header: imagePayload.header || '', body: imagePayload.body || '' }, imagePayload.storyId || '').catch(function() {});
+        imgCache.set(imagePayload.uuid, { dataUrl: dataUrl, fp: fp, fu: fu, prompt: imagePayload.prompt, characters: imagePayload.characters || [], settings: imagePayload.settings });
+    }
     return dataUrl;
 }
 
