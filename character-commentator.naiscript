@@ -3,8 +3,8 @@ compatibilityVersion: naiscript-1.0
 id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
-updatedAt: 1792148442000
-version: 2.10.5
+updatedAt: 1792149120000
+version: 2.10.6
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -376,7 +376,7 @@ async function convertAndSaveAvatarPngs(configuredName) {
     const savedBytes = Math.max(0, sourceBytes - outputBytes);
     await api.v1.ui.toast(
       `Avatar compression complete: ${convertedCount} saved, ${skippedCount} already smaller, ${failedCount} failed; saved ${formatByteCount(savedBytes)}.`,
-      { type: failedCount ? "warning" : "success" }
+      { type: failedCount ? "warning" : "success", autoClose: false }
     );
   } catch (error) {
     api.v1.error("Could not compress Lorebook avatars:", error);
