@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Character Engine — Bridge v3.0.43 (Temporary commentator expressions)
+// @name         Character Engine — Bridge v3.0.44 (Avatar WebP compression)
 // @namespace    Violentmonkey Scripts
-// @version      3.0.43
+// @version      3.0.44
 // @description  CE bridge: image generation, storage, painters, generation indicator
 // @match        https://novelai.net/*
 // @license      MIT
@@ -273,6 +273,41 @@ function sendToEngine(event, data) {
     catch(e) { console.error('[AE Bridge] sendToEngine failed:', e); }
 }
 
+function _ccCompressAvatarPng(dataUrl, maxWidth, maxHeight, quality) {
+    return new Promise(function(resolve, reject) {
+        if (typeof dataUrl !== 'string' || !/^data:image\/png;base64,/i.test(dataUrl)) {
+            reject(new Error('Only PNG data URLs can be compressed.'));
+            return;
+        }
+        var image = new Image();
+        image.onload = function() {
+            try {
+                var scale = Math.min(1, maxWidth / image.naturalWidth, maxHeight / image.naturalHeight);
+                var width = Math.max(1, Math.round(image.naturalWidth * scale));
+                var height = Math.max(1, Math.round(image.naturalHeight * scale));
+                var canvas = document.createElement('canvas');
+                canvas.width = width;
+                canvas.height = height;
+                var context = canvas.getContext('2d');
+                if (!context) throw new Error('Canvas is unavailable.');
+                context.drawImage(image, 0, 0, width, height);
+                var webpData = canvas.toDataURL('image/webp', quality);
+                canvas.width = 0;
+                canvas.height = 0;
+                if (webpData.indexOf('data:image/webp;base64,') !== 0) {
+                    reject(new Error('This browser cannot encode WebP images.'));
+                    return;
+                }
+                resolve({ imageData: webpData, width: width, height: height });
+            } catch (error) {
+                reject(error);
+            }
+        };
+        image.onerror = function() { reject(new Error('The PNG avatar could not be decoded.')); };
+        image.src = dataUrl;
+    });
+}
+
 var _ceVpLastW = -1, _ceVpLastH = -1, _ceVpTimer = null;
 function _ceViewportSend() {
     try {
@@ -362,6 +397,36 @@ function handleEngineMessage(payload, meta) {
                             event: 'CC_AVATAR_GENERATION_RESULT',
                             requestId: String(p.requestId),
                             error: m.slice(0, 240)
+                        });
+                    }
+                });
+            })(payload);
+            break;
+        case 'COMPRESS_AVATAR_PNG':
+            (function(p) {
+                _ccCompressAvatarPng(
+                    p.imageData,
+                    Number(p.maxWidth) || 164,
+                    Number(p.maxHeight) || 246,
+                    Number(p.quality) || 0.78
+                ).then(function(result) {
+                    if (p.replyToSid && p.requestId && NAITMBridge) {
+                        NAITMBridge.send(String(p.replyToSid), {
+                            event: 'CC_AVATAR_COMPRESSION_RESULT',
+                            requestId: String(p.requestId),
+                            imageData: result.imageData,
+                            width: result.width,
+                            height: result.height
+                        });
+                    }
+                }).catch(function(error) {
+                    var message = error && error.message ? String(error.message) : String(error);
+                    console.error('[CE Bridge] Avatar compression failed:', error);
+                    if (p.replyToSid && p.requestId && NAITMBridge) {
+                        NAITMBridge.send(String(p.replyToSid), {
+                            event: 'CC_AVATAR_COMPRESSION_RESULT',
+                            requestId: String(p.requestId),
+                            error: message.slice(0, 240)
                         });
                     }
                 });

@@ -3,8 +3,8 @@ compatibilityVersion: naiscript-1.0
 id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
-updatedAt: 1776512982753
-version: 2.10.4
+updatedAt: 1792148442000
+version: 2.10.5
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -119,7 +119,9 @@ const AVATAR_STYLE_STORAGE_KEY = "character-commentator-avatar-style";
 const AVATAR_STYLE_INPUT_KEY = "character-commentator-avatar-style-input";
 const CHARACTER_AVATAR_ENTRY_PREFIX = "Character Avatar - ";
 const AVATAR_BRIDGE_RESULT_EVENT = "CC_AVATAR_GENERATION_RESULT";
+const AVATAR_COMPRESSION_RESULT_EVENT = "CC_AVATAR_COMPRESSION_RESULT";
 const AVATAR_BRIDGE_TIMEOUT_MS = 240000;
+const AVATAR_COMPRESSION_TIMEOUT_MS = 60000;
 const AVATAR_BRIDGE_INSTALL_URL = "https://raw.githubusercontent.com/Nuku/character-commentator-auto-avatar/main/Bridge.user.js";
 let avatarBridgeSubscribed = false;
 let avatarBridgeReady = false;
@@ -127,6 +129,8 @@ let avatarBridgeSupportsExpressions = false;
 let avatarBridgeMissing = false;
 const avatarBridgeWaiters = [];
 const pendingAvatarGenerations = new Map();
+const pendingAvatarCompressions = new Map();
+let isCompressingAvatars = false;
 
 async function handleAvatarBridgeMessage(message) {
   const payload = message && message.data && message.data.payload
@@ -139,7 +143,15 @@ async function handleAvatarBridgeMessage(message) {
     while (avatarBridgeWaiters.length) avatarBridgeWaiters.shift()(true);
     return;
   }
-  if (payload.event !== AVATAR_BRIDGE_RESULT_EVENT || !payload.requestId) return;
+  if (!payload.requestId) return;
+  if (payload.event === AVATAR_COMPRESSION_RESULT_EVENT) {
+    const compression = pendingAvatarCompressions.get(payload.requestId);
+    if (!compression) return;
+    pendingAvatarCompressions.delete(payload.requestId);
+    compression(payload);
+    return;
+  }
+  if (payload.event !== AVATAR_BRIDGE_RESULT_EVENT) return;
   const pending = pendingAvatarGenerations.get(payload.requestId);
   if (!pending) return;
   pendingAvatarGenerations.delete(payload.requestId);
@@ -190,6 +202,187 @@ async function copyAvatarBridgeInstallLink() {
   } catch (error) {
     api.v1.error("Could not copy the bridge install link:", error);
     await api.v1.ui.toast(`Open this bridge install link: ${AVATAR_BRIDGE_INSTALL_URL}`, { type: "warning" });
+  }
+}
+
+function imageDataUriBytes(dataUri) {
+  const payload = String(dataUri || "").split(",", 2)[1] || "";
+  const base64 = payload.replace(/\s/g, "");
+  if (!base64) return 0;
+  return Math.max(0, Math.floor(base64.length * 3 / 4) - (base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0));
+}
+
+function formatByteCount(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+async function requestAvatarCompression(imageData) {
+  const requestId = api.v1.uuid();
+  const resultPromise = new Promise(resolve => {
+    pendingAvatarCompressions.set(requestId, resolve);
+    api.v1.timers.setTimeout(() => {
+      if (pendingAvatarCompressions.has(requestId)) {
+        pendingAvatarCompressions.delete(requestId);
+        resolve({ error: "Avatar conversion timed out." });
+      }
+    }, AVATAR_COMPRESSION_TIMEOUT_MS);
+  });
+
+  try {
+    await api.v1.messaging.broadcast({
+      type: "MESSAGE", sid: api.v1.script.id,
+      payload: {
+        event: "COMPRESS_AVATAR_PNG", requestId, replyToSid: api.v1.script.id,
+        imageData, maxWidth: 164, maxHeight: 246, quality: 0.78
+      }
+    }, "hypebot");
+  } catch (error) {
+    pendingAvatarCompressions.delete(requestId);
+    throw error;
+  }
+
+  return await resultPromise;
+}
+
+function isAvatarStorageEntry(entry, configuredName) {
+  const name = String(entry?.displayName || "").trim().toLowerCase();
+  return name === "avatars" || (!!configuredName && name === configuredName.toLowerCase()) ||
+    name.startsWith("character avatar");
+}
+
+function getPngDataUris(text) {
+  return String(text || "").match(/data:image\/png;base64,[A-Za-z0-9+/=]+/gi) || [];
+}
+
+async function previewAvatarCompression() {
+  if (isCompressingAvatars) return;
+  let modal;
+  try {
+    const configuredName = String(await api.v1.config.get("avatarLorebookName") || "Avatars").trim();
+    const entries = (await api.v1.lorebook.entries()).filter(entry => isAvatarStorageEntry(entry, configuredName));
+    const rows = entries.map(entry => {
+      const pngs = [...new Set(getPngDataUris(entry.text))];
+      return {
+        id: entry.id,
+        name: entry.displayName || entry.id,
+        count: pngs.length,
+        bytes: pngs.reduce((sum, uri) => sum + imageDataUriBytes(uri), 0)
+      };
+    }).filter(row => row.count > 0);
+    const imageCount = rows.reduce((sum, row) => sum + row.count, 0);
+    const sourceBytes = rows.reduce((sum, row) => sum + row.bytes, 0);
+    if (!imageCount) {
+      await api.v1.ui.toast("No PNG avatars found in Avatars or Character Avatar entries.", { type: "info" });
+      return;
+    }
+
+    const rowSummary = rows.slice(0, 12).map(row => `• ${row.name}: ${row.count} PNG${row.count === 1 ? "" : "s"}`).join("\n");
+    const hiddenCount = Math.max(0, rows.length - 12);
+    modal = await api.v1.ui.modal.open({
+      title: "Compress Character Avatars",
+      size: "medium",
+      content: [
+        {
+          type: "text",
+          text: `Found ${imageCount} PNG avatar${imageCount === 1 ? "" : "s"} in ${rows.length} Lorebook entr${rows.length === 1 ? "y" : "ies"} (${formatByteCount(sourceBytes)} total). The Bridge will resize each to fit within 164 × 246 px and encode WebP at 78% quality. Entries are saved only when the converted image is smaller.\n\n${rowSummary}${hiddenCount ? `\n…and ${hiddenCount} more entr${hiddenCount === 1 ? "y" : "ies"}.` : ""}`,
+          style: { whiteSpace: "pre-wrap", marginBottom: "12px" }
+        },
+        {
+          type: "row",
+          style: { gap: "8px" },
+          content: [
+            { type: "button", text: "Cancel", callback: async () => modal?.close() },
+            {
+              type: "button",
+              text: `Convert ${imageCount} PNG${imageCount === 1 ? "" : "s"}`,
+              callback: async () => {
+                await modal?.close();
+                await convertAndSaveAvatarPngs(configuredName);
+              }
+            }
+          ]
+        }
+      ]
+    });
+  } catch (error) {
+    api.v1.error("Could not preview avatar compression:", error);
+    await api.v1.ui.toast("Could not inspect the avatar Lorebook entries.", { type: "warning" });
+  }
+}
+
+async function convertAndSaveAvatarPngs(configuredName) {
+  if (isCompressingAvatars) return;
+  isCompressingAvatars = true;
+  try {
+    const hasPermission = await api.v1.permissions.request("lorebookEdit");
+    if (!hasPermission) {
+      await api.v1.ui.toast("Lorebook edit permission is required to save compressed avatars.", { type: "warning" });
+      return;
+    }
+    if (!await connectAvatarBridge()) {
+      await api.v1.ui.toast("The Character Engine Bridge is not connected.", { type: "warning" });
+      return;
+    }
+
+    const entries = (await api.v1.lorebook.entries()).filter(entry => isAvatarStorageEntry(entry, configuredName));
+    const imageCount = entries.reduce((sum, entry) => sum + new Set(getPngDataUris(entry.text)).size, 0);
+    if (!imageCount) {
+      await api.v1.ui.toast("No PNG avatars remain to compress.", { type: "info" });
+      return;
+    }
+    await api.v1.ui.toast(`Compressing ${imageCount} PNG avatar${imageCount === 1 ? "" : "s"}…`, { type: "info" });
+    let convertedCount = 0;
+    let skippedCount = 0;
+    let failedCount = 0;
+    let sourceBytes = 0;
+    let outputBytes = 0;
+    for (const listedEntry of entries) {
+      const entry = await api.v1.lorebook.entry(listedEntry.id);
+      if (!entry) continue;
+      let text = String(entry.text || "");
+      const pngs = [...new Set(getPngDataUris(text))];
+      if (!pngs.length) continue;
+      let entryChanged = false;
+      for (const png of pngs) {
+        try {
+          const result = await requestAvatarCompression(png);
+          if (result.error || !String(result.imageData || "").startsWith("data:image/webp;base64,")) {
+            throw new Error(result.error || "The Bridge did not return WebP data.");
+          }
+          const before = imageDataUriBytes(png);
+          const after = imageDataUriBytes(result.imageData);
+          sourceBytes += before;
+          if (after >= before) {
+            skippedCount++;
+            outputBytes += before;
+            continue;
+          }
+          text = text.split(png).join(result.imageData);
+          outputBytes += after;
+          convertedCount++;
+          entryChanged = true;
+        } catch (error) {
+          failedCount++;
+          api.v1.error(`Could not compress an avatar in ${entry.displayName || entry.id}:`, error);
+        }
+      }
+      if (entryChanged) {
+        await api.v1.lorebook.updateEntry(entry.id, { text });
+      }
+    }
+
+    const savedBytes = Math.max(0, sourceBytes - outputBytes);
+    await api.v1.ui.toast(
+      `Avatar compression complete: ${convertedCount} saved, ${skippedCount} already smaller, ${failedCount} failed; saved ${formatByteCount(savedBytes)}.`,
+      { type: failedCount ? "warning" : "success" }
+    );
+  } catch (error) {
+    api.v1.error("Could not compress Lorebook avatars:", error);
+    await api.v1.ui.toast("Avatar compression stopped. Any entries already saved remain updated.", { type: "warning" });
+  } finally {
+    isCompressingAvatars = false;
   }
 }
 
@@ -1881,6 +2074,13 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
                   await setSoloSpeakerName(selectedCharacter.name);
                 }
               }
+            },
+            {
+              type: "button",
+              text: "Compress Avatars",
+              iconId: "image",
+              style: { fontSize: '12px', marginBottom: '0' },
+              callback: previewAvatarCompression
             }
           ]
         },
