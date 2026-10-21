@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Character Engine — Bridge v3.0.44 (Avatar WebP compression)
+// @name         Character Engine — Bridge v3.0.46 (match expression reference dimensions)
 // @namespace    Violentmonkey Scripts
-// @version      3.0.44
+// @version      3.0.46
 // @description  CE bridge: image generation, storage, painters, generation indicator
 // @match        https://novelai.net/*
 // @license      MIT
@@ -953,11 +953,23 @@ async function preparePreciseReference(dataUrl) {
     canvas.width = sizes[0][0]; canvas.height = sizes[0][1];
     var context = canvas.getContext('2d');
     if (!context) throw new Error('Could not prepare the avatar reference.');
-    context.fillStyle = '#000'; context.fillRect(0, 0, canvas.width, canvas.height);
+    // Fill aspect-ratio padding with a blurred, enlarged copy of the avatar instead of black.
+    var coverScale = Math.max(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight);
+    var coverWidth = image.naturalWidth * coverScale;
+    var coverHeight = image.naturalHeight * coverScale;
+    context.save();
+    context.filter = 'blur(32px)';
+    context.drawImage(image, (canvas.width - coverWidth) / 2 - 48, (canvas.height - coverHeight) / 2 - 48,
+        coverWidth + 96, coverHeight + 96);
+    context.restore();
     var scale = Math.min(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight);
     var width = Math.round(image.naturalWidth * scale), height = Math.round(image.naturalHeight * scale);
     context.drawImage(image, Math.floor((canvas.width - width) / 2), Math.floor((canvas.height - height) / 2), width, height);
-    return canvas.toDataURL('image/png').split(',')[1];
+    return {
+        image: canvas.toDataURL('image/png').split(',')[1],
+        width: canvas.width,
+        height: canvas.height
+    };
 }
 
 async function generateCommentImage(imagePayload) {
@@ -969,7 +981,12 @@ async function generateCommentImage(imagePayload) {
     }
     if (imagePayload.preciseReferenceImage) {
         if (body.model !== 'nai-diffusion-4-5-full') throw new Error('Avatar Precise Reference requires V4.5 Full.');
-        body.parameters.director_reference_images = [await preparePreciseReference(imagePayload.preciseReferenceImage)];
+        var preciseReference = await preparePreciseReference(imagePayload.preciseReferenceImage);
+        body.parameters.director_reference_images = [preciseReference.image];
+        if (imagePayload.kind === 'commentatorExpression') {
+            body.parameters.width = preciseReference.width;
+            body.parameters.height = preciseReference.height;
+        }
         body.parameters.director_reference_descriptions = [{ caption: { base_caption: 'character&style', char_captions: [] }, legacy_uc: false }];
         body.parameters.director_reference_information_extracted = [1];
         body.parameters.director_reference_strength_values = [1];

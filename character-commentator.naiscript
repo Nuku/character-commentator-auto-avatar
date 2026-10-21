@@ -4,7 +4,7 @@ id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
 updatedAt: 1792149120000
-version: 2.10.6
+version: 2.10.8
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -571,10 +571,10 @@ async function generateEmotionAvatar(character, baseImage, comment) {
   api.v1.log(`[Character Expression] ${character.name}: ${emotion}`);
   const storyStyle = await getAvatarStyleSentence();
   const appearance = getSavedCharacterAppearance(character);
-  const characterVisuals = [appearance?.description, storyStyle, expressions[emotion]].filter(Boolean).join(" ");
+  const characterVisuals = [appearance?.description, storyStyle].filter(Boolean).join(" ");
   const result = await requestAvatarImage({
     kind: "commentatorExpression", temporary: true, preciseReferenceImage: baseImage,
-    prompt: `${storyStyle ? `${storyStyle} ` : ""}${appearance?.isNonHumanoid ? "fur dataset, " : ""}Solo character, centered upper-body portrait, entire head and shoulders visible, looking toward viewer, simple background. Preserve the reference character's identity, species, facial features, hair, colors, clothing and art style. Change the facial expression to: ${expressions[emotion]}.`,
+    prompt: `They look ${emotion}.`,
     characters: [{ name: character.name, visuals: characterVisuals, uc: "" }],
     settings: {
       model: "nai-diffusion-4-5-full", width: 832, height: 1216,
@@ -582,7 +582,7 @@ async function generateEmotionAvatar(character, baseImage, comment) {
       negative: "lowres, worst quality, bad anatomy, text, watermark, multiple people"
     }
   });
-  return result.imageData;
+  return { imageData: result.imageData, emotion };
 }
 
 // Safety function to reset generation flag if it gets stuck
@@ -1938,7 +1938,7 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
     const commentParts = parseMarkdown(comment, { fontSize: '14px' });
     
     // Build character name with thinking ratio if available
-    const characterDisplayName = thinkingRatio !== null 
+    let characterDisplayName = thinkingRatio !== null
       ? `${selectedCharacter.name} (Thinking Ratio: ${thinkingRatio}%)`
       : selectedCharacter.name;
     
@@ -2111,10 +2111,14 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
 
     // Expressions always use the saved original and remain only in the current UI.
     try {
-      const expressionImage = await generateEmotionAvatar(selectedCharacter, expressionBaseImage, comment);
-      if (expressionImage && currentChatCharacter === selectedCharacter.name &&
+      const expression = await generateEmotionAvatar(selectedCharacter, expressionBaseImage, comment);
+      if (expression?.imageData && currentChatCharacter === selectedCharacter.name &&
           await getAvatarFromLorebook(selectedCharacter.name, selectedCharacter.displayName) === expressionBaseImage) {
-        await api.v1.commentBot.update({ ...speakingView, image: expressionImage });
+        characterDisplayName = thinkingRatio !== null
+          ? `${selectedCharacter.name} (Thinking Ratio: ${thinkingRatio}%, ${expression.emotion})`
+          : `${selectedCharacter.name} (${expression.emotion})`;
+        speakingView.content[0].content[0].text = characterDisplayName;
+        await api.v1.commentBot.update({ ...speakingView, image: expression.imageData });
       }
     } catch (error) {
       api.v1.error("Could not generate temporary character expression:", error);
