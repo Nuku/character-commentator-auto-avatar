@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Character Engine — Bridge v3.0.47 (CommentBot portrait viewer)
+// @name         Character Engine — Bridge v3.0.48 (CommentBot portrait viewer)
 // @namespace    Violentmonkey Scripts
-// @version      3.0.47
+// @version      3.0.48
 // @description  CE bridge: image generation, storage, painters, generation indicator
 // @match        https://novelai.net/*
 // @license      MIT
@@ -895,7 +895,11 @@ async function callGenerateAPI(body) {
             headers: { 'Content-Type': 'application/json', 'Authorization': auth },
             body: JSON.stringify(body)
         });
-        if (!resp.ok) throw new Error('NAI API ' + resp.status);
+        if (!resp.ok) {
+            var errorBody = '';
+            try { errorBody = (await resp.text()).slice(0, 240); } catch (_eBody) {}
+            throw new Error('NAI API ' + resp.status + (errorBody ? ': ' + errorBody : ''));
+        }
         var reader = resp.body.getReader(), dec = new TextDecoder();
         var buf = '', chunks = [], lastJpeg = null;
         while (true) {

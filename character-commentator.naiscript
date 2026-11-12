@@ -3,8 +3,8 @@ compatibilityVersion: naiscript-1.0
 id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
-updatedAt: 1794498152000
-version: 2.10.10
+updatedAt: 1794499039000
+version: 2.10.11
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -583,6 +583,16 @@ async function generateEmotionAvatar(character, baseImage, comment) {
     }
   });
   return { imageData: result.imageData, emotion };
+}
+
+function describeAvatarError(error) {
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  if (typeof error === "string") return error;
+  try {
+    return JSON.stringify(error) || String(error);
+  } catch {
+    return String(error);
+  }
 }
 
 // Safety function to reset generation flag if it gets stuck
@@ -1944,11 +1954,6 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
     
     const commentContent = [
         {
-          type: "text",
-          text: "ce-commentbot-image-v1",
-          style: { display: "none" }
-        },
-        {
           type: "container",
           style: {
             display: 'flex',
@@ -2099,6 +2104,11 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
             overflowY: 'auto'
           },
           content: characterButtons
+        },
+        {
+          type: "text",
+          text: "ce-commentbot-image-v1",
+          style: { display: "none" }
         }
       ];
 
@@ -2126,8 +2136,9 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
         await api.v1.commentBot.update({ ...speakingView, image: expression.imageData });
       }
     } catch (error) {
-      api.v1.error("Could not generate temporary character expression:", error);
-      await api.v1.ui.toast("Could not generate the expression; keeping the saved avatar.", { type: "warning" });
+      const details = describeAvatarError(error);
+      api.v1.error(`Could not generate temporary character expression: ${details}`);
+      await api.v1.ui.toast(`Could not generate the expression; keeping the saved avatar. ${details}`, { type: "warning" });
     }
     
   } catch (error) {
