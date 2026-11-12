@@ -3,8 +3,8 @@ compatibilityVersion: naiscript-1.0
 id: b7e9c21a-4f3d-48e2-9a5b-2d8e1f6c9a4e
 name: Character Commentator
 createdAt: 1739139600000
-updatedAt: 1792149120000
-version: 2.10.8
+updatedAt: 1794498152000
+version: 2.10.10
 author: Claude
 description: Random characters from your lorebook comment on story events through the HypeBot after each generation.
 memoryLimit: 16
@@ -1943,6 +1943,11 @@ async function generateAndShowComment(skipChanceCheck = false, forceCharacter = 
       : selectedCharacter.name;
     
     const commentContent = [
+        {
+          type: "text",
+          text: "ce-commentbot-image-v1",
+          style: { display: "none" }
+        },
         {
           type: "container",
           style: {

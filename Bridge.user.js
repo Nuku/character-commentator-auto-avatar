@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Character Engine — Bridge v3.0.46 (match expression reference dimensions)
+// @name         Character Engine — Bridge v3.0.47 (CommentBot portrait viewer)
 // @namespace    Violentmonkey Scripts
-// @version      3.0.46
+// @version      3.0.47
 // @description  CE bridge: image generation, storage, painters, generation indicator
 // @match        https://novelai.net/*
 // @license      MIT
@@ -1902,6 +1902,93 @@ function _ccavStart() {
     _ccavNudge();
 }
 
+// The CommentBot image is rendered by NovelAI. Its script exposes only a card-wide
+// callback, so this marker lets the Bridge add an image-local view control.
+var CE_COMMENTBOT_IMAGE_MARKER = 'ce-commentbot-image-v1';
+var _ceCommentBotImageObs = null;
+var _ceCommentBotImageTmr = null;
+
+function _ceCommentBotImageForMarker(node) {
+    var el = node.parentElement;
+    var hops = 0;
+    while (el && el !== document.body && hops < 12) {
+        var images = el.querySelectorAll ? el.querySelectorAll('img') : [];
+        for (var i = 0; i < images.length; i++) {
+            var img = images[i];
+            var rect = img.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0 && (img.currentSrc || img.src)) return img;
+        }
+        el = el.parentElement;
+        hops++;
+    }
+    return null;
+}
+
+function _ceCommentBotImagePaint() {
+    if (!document.body) return;
+    var walker;
+    try {
+        walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+            acceptNode: function(node) {
+                return (node.nodeValue || '').indexOf(CE_COMMENTBOT_IMAGE_MARKER) >= 0
+                    ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+            }
+        });
+    } catch (_e) { return; }
+
+    var marker;
+    while ((marker = walker.nextNode())) {
+        var img = _ceCommentBotImageForMarker(marker);
+        if (!img || !img.parentElement) continue;
+        var host = img.parentElement;
+        host.classList.add('ae-commentbot-image-host');
+        var button = host.querySelector(':scope > .ae-commentbot-view');
+        if (!button) {
+            button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'ae-commentbot-view';
+            button.title = 'View full image';
+            button.setAttribute('aria-label', 'View full image');
+            var icon = _ceMiniIcon('view', 15);
+            if (icon) button.appendChild(icon);
+            button.addEventListener('click', function(event) {
+                event.preventDefault();
+                event.stopPropagation();
+                if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+                var currentImage = button.__ceCommentBotImage;
+                if (currentImage) _galleryLightbox(currentImage.currentSrc || currentImage.src, 'Character portrait');
+            });
+            host.appendChild(button);
+        }
+
+        button.__ceCommentBotImage = img;
+        var imageRect = img.getBoundingClientRect();
+        var hostRect = host.getBoundingClientRect();
+        button.style.left = Math.max(0, imageRect.right - hostRect.left - 24) + 'px';
+        button.style.top = Math.max(0, imageRect.top - hostRect.top + 4) + 'px';
+    }
+}
+
+function _ceCommentBotImageSchedule() {
+    if (_ceCommentBotImageTmr) clearTimeout(_ceCommentBotImageTmr);
+    _ceCommentBotImageTmr = setTimeout(function() {
+        _ceCommentBotImageTmr = null;
+        _ceCommentBotImagePaint();
+    }, 80);
+}
+
+function _ceCommentBotImageStart() {
+    if (_ceCommentBotImageObs || !document.body) return;
+    try {
+        _ceCommentBotImageObs = new MutationObserver(_ceCommentBotImageSchedule);
+        _ceCommentBotImageObs.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['src'] });
+    } catch (e) {
+        console.warn('[CE:commentbot-image] observer unavailable:', e);
+        _ceCommentBotImageObs = null;
+    }
+    _ceCommentBotImagePaint();
+}
+
 // SECTION 13e — CE SURFACE IMAGE PAINTER
 
 var CE_IMG_ATTR  = 'data-ce-img';
@@ -2262,6 +2349,14 @@ var CE_IMG_CSS = [
 '  width:var(--ae-cca-size,40px);height:calc(var(--ae-cca-size,40px) * var(--ae-cca-h-mult,1));',
 '  border-radius:var(--ae-cca-radius,50%);object-fit:cover;border:1px solid var(--ae-bg-border);',
 '  background:var(--ae-bg-raised);box-shadow:var(--ae-shadow-sm);}',
+'.ae-commentbot-image-host{position:relative;}',
+'.ae-commentbot-view{position:absolute;width:24px;height:24px;padding:0;display:flex;align-items:center;justify-content:center;',
+'  border:0;border-radius:6px;background:rgba(12,12,16,0.8);color:#fff;cursor:pointer;opacity:0;',
+'  transition:opacity 140ms ease,background 140ms ease;z-index:9999;}',
+'.ae-commentbot-image-host:hover > .ae-commentbot-view,.ae-commentbot-view:focus-visible{opacity:0.92;}',
+'.ae-commentbot-view:hover{opacity:1;background:rgba(12,12,16,0.96);}',
+'.ae-commentbot-view:focus-visible{outline:2px solid var(--ae-accent);outline-offset:1px;}',
+'@media (hover:none){.ae-commentbot-view{opacity:0.82;}}',
 '.ae-ccctl-anchor{position:relative;height:0;overflow:visible;display:block;width:100%;}',
 '.ae-ccctl{position:absolute;left:var(--ae-cc-avaleft,calc(89% - var(--ae-cca-size,40px) / 2));top:6px;',
 '  width:calc(var(--ae-cca-size,40px) + 22px);',
@@ -2290,8 +2385,9 @@ var CE_IMG_CSS = [
 
 var CE_MINI_ICON_PATHS = {
     download: ['M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4', 'M7 10l5 5 5-5', 'M12 15V3'],
-    trash: ['M3 6h18', 'M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2', 'M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6']
-    ,pencil: ['M12 20h9', 'M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z']
+    trash: ['M3 6h18', 'M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2', 'M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6'],
+    pencil: ['M12 20h9', 'M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z'],
+    view: ['M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z', 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z']
 };
 function _ceMiniIcon(name, size) {
     var ds = CE_MINI_ICON_PATHS[name];
@@ -2327,6 +2423,7 @@ function initUI() {
 
     try { _ceStoryImgStart(); } catch (_esi) { console.error('[CE Bridge] story image observer failed:', _esi); }
     try { _ccavStart(); } catch (_eav) { console.error('[CE Bridge] chat avatar observer failed:', _eav); }
+    try { _ceCommentBotImageStart(); } catch (_ecbi) { console.error('[CE Bridge] CommentBot image control failed:', _ecbi); }
     try { _ceSurfImgStart(); } catch (_esu) { console.error('[CE Bridge] surface image scanner failed:', _esu); }
 
     loadCachedImgFields();
