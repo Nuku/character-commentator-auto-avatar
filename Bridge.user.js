@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Character Engine — Bridge v3.0.48 (CommentBot portrait viewer)
+// @name         Character Engine — Bridge v3.0.49 (CommentBot portrait viewer fix)
 // @namespace    Violentmonkey Scripts
-// @version      3.0.48
+// @version      3.0.49
 // @description  CE bridge: image generation, storage, painters, generation indicator
 // @match        https://novelai.net/*
 // @license      MIT
@@ -1916,16 +1916,27 @@ function _ceCommentBotImageForMarker(node) {
     var el = node.parentElement;
     var hops = 0;
     while (el && el !== document.body && hops < 12) {
-        var images = el.querySelectorAll ? el.querySelectorAll('img') : [];
-        for (var i = 0; i < images.length; i++) {
-            var img = images[i];
-            var rect = img.getBoundingClientRect();
-            if (rect.width > 0 && rect.height > 0 && (img.currentSrc || img.src)) return img;
+        if (el.matches && el.matches('.script-comment-container')) {
+            var avatar = el.querySelector('.script-comment-avatar');
+            if (avatar) {
+                var rect = avatar.getBoundingClientRect();
+                if (rect.width > 0 && rect.height > 0) return avatar;
+            }
+            return null;
         }
         el = el.parentElement;
         hops++;
     }
     return null;
+}
+
+function _ceCommentBotImageSource(element) {
+    if (!element) return '';
+    var src = element.currentSrc || element.src;
+    if (src) return src;
+    var background = window.getComputedStyle(element).backgroundImage || '';
+    var match = background.match(/^url\((.*)\)$/);
+    return match ? match[1].replace(/^['"]|['"]$/g, '') : '';
 }
 
 function _ceCommentBotImagePaint() {
@@ -1960,7 +1971,8 @@ function _ceCommentBotImagePaint() {
                 event.stopPropagation();
                 if (event.stopImmediatePropagation) event.stopImmediatePropagation();
                 var currentImage = button.__ceCommentBotImage;
-                if (currentImage) _galleryLightbox(currentImage.currentSrc || currentImage.src, 'Character portrait');
+                var source = _ceCommentBotImageSource(currentImage);
+                if (source) _galleryLightbox(source, 'Character portrait');
             });
             host.appendChild(button);
         }
@@ -1984,8 +1996,16 @@ function _ceCommentBotImageSchedule() {
 function _ceCommentBotImageStart() {
     if (_ceCommentBotImageObs || !document.body) return;
     try {
-        _ceCommentBotImageObs = new MutationObserver(_ceCommentBotImageSchedule);
-        _ceCommentBotImageObs.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['src'] });
+        _ceCommentBotImageObs = new MutationObserver(function(records) {
+            for (var i = 0; i < records.length; i++) {
+                var target = records[i].target;
+                if (records[i].type !== 'attributes' || (target.matches && target.matches('.script-comment-avatar'))) {
+                    _ceCommentBotImageSchedule();
+                    return;
+                }
+            }
+        });
+        _ceCommentBotImageObs.observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['src', 'style', 'class'] });
     } catch (e) {
         console.warn('[CE:commentbot-image] observer unavailable:', e);
         _ceCommentBotImageObs = null;
